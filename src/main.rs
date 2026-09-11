@@ -123,13 +123,13 @@ fn push(repo: &git2::Repository) -> Result<()> {
         let host = git::host_of(&url)
             .ok_or_else(|| DotgitError::from(format!("cannot parse remote URL: {url}")))?;
         let credentials = if host.contains("gitlab") {
-            let token = env::var("GITLAB_TOKEN")
-                .or_else(|_| env::var("GL_TOKEN"))
-                .map_err(|_| {
-                    DotgitError::from(
-                        "to push to GitLab, set GITLAB_TOKEN (a GitLab personal access token)",
-                    )
-                })?;
+            let token = match env::var("GITLAB_TOKEN").or_else(|_| env::var("GL_TOKEN")) {
+                Ok(t) => t,
+                Err(_) => {
+                    let glab = gh::read_glab_credentials()?;
+                    glab.token
+                }
+            };
             gh::HostCredentials {
                 username: "oauth2".into(),
                 token,

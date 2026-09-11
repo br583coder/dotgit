@@ -12,6 +12,44 @@ pub struct HostCredentials {
     pub token: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct GlabHost {
+    pub token: String,
+}
+
+pub fn read_glab_credentials() -> Result<GlabHost> {
+    let path = glab_config_path()?;
+    let yaml = fs::read_to_string(&path).map_err(|_| {
+        DotgitError::from(
+            "glab is not configured; run `glab auth login` (or set GITLAB_TOKEN)",
+        )
+    })?;
+    let mut token = None;
+    for raw in yaml.lines() {
+        let (key, value) = match raw.trim().split_once(':') {
+            Some((k, v)) => (k, v.trim().trim_matches('"')),
+            None => continue,
+        };
+        if key == "oauth_token" {
+            token = Some(value.to_string());
+        }
+    }
+    Ok(GlabHost {
+        token: token.ok_or_else(|| {
+            DotgitError::from("no token found in glab config; run `glab auth login`")
+        })?,
+    })
+}
+
+fn glab_config_path() -> Result<PathBuf> {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)
+        .ok_or_else(|| anyhow!("cannot determine your config directory"))?;
+    Ok(base.join("glab-cli").join("config.yml"))
+}
+
 pub fn ensure_gh() -> Result<()> {
     match Command::new("gh").arg("--version").output() {
         Ok(out) if out.status.success() => Ok(()),
