@@ -1,0 +1,11 @@
+[package]
+name = "dotgit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+git2 = "0.19"
+thiserror = "2"
