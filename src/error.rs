@@ -12,10 +12,10 @@ pub enum DotgitError {
     Git(#[from] git2::Error),
     #[error("{0}")]
     Message(String),
-    #[error("GitHub CLI (gh) is required: {0}")]
-    GhUnavailable(String),
-    #[error("GitHub CLI (gh) is not authenticated for {0}; run `dotgit login` or `gh auth login`")]
-    GhNotAuthenticated(String),
+    #[error("{cli} is required: {hint}")]
+    CliUnavailable { cli: String, hint: String },
+    #[error("{cli} is not authenticated for {host}; run `dotgit login {host}` or `{cli} auth login --hostname {host}`")]
+    NotAuthenticated { cli: String, host: String },
 }
 
 impl From<&str> for DotgitError {

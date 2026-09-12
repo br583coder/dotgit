@@ -1,7 +1,7 @@
 # dotgit
 
-A dotfile manager backed by `git` + `gh` auth. Upload files from your machine into a
-git repository and commit them without ever typing a password.
+A dotfile manager backed by `git` + `gh`/`glab` auth. Upload files from your machine
+into a GitHub or GitLab repository and commit them without ever typing a password.
 
 `dotgit` mirrors dotfiles from your machine into a repo's working tree (paths are
 preserved relative to `$HOME`), stages them, prompts for a commit message, commits,
@@ -10,8 +10,12 @@ you already logged into.
 
 ## Features
 
+- **GitHub and GitLab as equals** — every command (`new`, `login`, pushing) works the
+  same on either, driving `gh` or `glab` as appropriate, including self-hosted hosts.
 - **Passwordless** — never stores or asks for credentials; reuses your `gh` / `glab` /
   GitLab token logins.
+- **Creates the repo for you** — `dotgit new <name>` asks whether you want it on
+  GitHub or GitLab, drives `gh`/`glab auth login` when needed, and wires up `origin`.
 - **Upload anything** — files or whole folders, including hidden/gitignored files
   (uploads are force-added).
 - **Incremental** — re-uploading a folder copies only what actually changed, so
@@ -65,21 +69,23 @@ authenticated:
 | GitLab   | `GITLAB_TOKEN`/`GL_TOKEN` env var | exported in your shell                   |
 | SSH      | your ssh key/agent   | `~/.ssh/`                                           |
 
-For GitHub, you can let dotgit drive the login:
+You can let dotgit drive either login:
 
 ```
-dotgit login                  # = gh auth login --hostname github.com
-dotgit login gitlab.company   # = gh auth login for that host
+dotgit login                    # = gh auth login --hostname github.com
+dotgit login --gitlab           # = glab auth login --hostname gitlab.com
+dotgit login gitlab.company.net # host says GitLab, so glab is used
+dotgit login github.company.net # host says GitHub, so gh is used
 ```
 
-`dotgit login` only wraps the `gh` CLI. For GitLab, log in once with
-`glab auth login` and forget about it.
+You rarely need it: `dotgit new` and `dotgit commit` both start the right login flow
+themselves when the host you are talking to has no credentials yet.
 
 ## Quick start
 
 ```bash
-# 1. Create a repo, e.g. via gh:
-gh repo create mydotfiles --private --clone
+# 1. Create the repository (you'll be asked GitHub or GitLab)
+dotgit new mydotfiles
 
 # 2. Upload a folder from your machine into the repo
 cd mydotfiles
@@ -92,6 +98,47 @@ dotgit commit
 That's it. Every future edit lives at `~/.config/hypr`; upload + commit to sync.
 
 ## Commands
+
+### `dotgit new <name>`
+
+Creates a repository on GitHub or GitLab and sets it up locally. With no `--github`
+or `--gitlab` flag it asks which one you want:
+
+```
+$ dotgit new mydotfiles
+Where should this repository live? [1] GitHub  [2] GitLab: 1
+created GitHub repository mydotfiles (private)
+origin -> https://github.com/octocat/mydotfiles
+local repository: /home/you/mydotfiles
+next: cd /home/you/mydotfiles && dotgit upload ~/.config/... && dotgit commit
+```
+
+The prompt accepts `1`/`github`/`gh` or `2`/`gitlab`/`glab`.
+
+Before creating anything it checks that the right CLI is installed and logged in,
+and runs `gh auth login` / `glab auth login` for you if it is not — so a failed
+login never leaves a half-made repository behind.
+
+```
+dotgit new mydotfiles                    # ask which forge
+dotgit new mydotfiles --github           # skip the prompt
+dotgit new mydotfiles --gitlab --public  # public GitLab project
+dotgit new me/mydotfiles --gitlab        # create under a namespace/group
+dotgit new dots --github --host github.company.com
+```
+
+Repositories are **private** unless you pass `--public`. A name with a namespace
+(`me/dots`) creates the local directory as `dots`.
+
+Where the local repository ends up:
+
+- If you run it inside a git repository that has **no `origin`**, it attaches the new
+  remote to that repository.
+- Otherwise it creates `./<name>` with `git init` (on branch `main`) and points
+  `origin` at the new remote.
+
+If `./<name>` already exists, dotgit stops and tells you the remote URL to attach
+yourself rather than touching the existing directory.
 
 ### `dotgit upload <paths>...`
 
@@ -150,13 +197,19 @@ pushes. An empty message aborts.
 
 ### `dotgit login [host]`
 
-Runs `gh auth login --hostname <host>` (default `github.com`) so dotgit can read your
-token. After a successful gh login, `dotgit` recognizes you immediately.
+Runs `gh auth login` or `glab auth login` for `<host>` so dotgit can read your token.
+The host itself decides which CLI is used — a `gitlab.*` host goes to `glab`, a
+`github.*` host to `gh` — and `--github` / `--gitlab` override that.
 
 ```
-dotgit login
-dotgit login github.com
+dotgit login                    # gh, github.com
+dotgit login --gitlab           # glab, gitlab.com
+dotgit login gitlab.company.net # glab, self-hosted GitLab
+dotgit login git.example.com    # gh (GitHub Enterprise is the fallback)
 ```
+
+A host that names neither forge falls back to `gh`, which is where a GitHub
+Enterprise login lives.
 
 ## How pushing works
 
@@ -166,13 +219,18 @@ dotgit login github.com
 |------------------------------------------|----------------------------------------|
 | `https://github.com/me/dotfiles.git`     | gh token (pushes as your gh user)      |
 | `https://gitlab.com/me/dotfiles.git`     | glab token or `GITLAB_TOKEN`           |
+| `https://gitlab.company.net/me/dots.git` | glab token for that host               |
 | `https://git.gitea.host/...`             | gh token if gh is logged into that host |
 | `git@github.com:me/dotfiles.git` (SSH)   | your ssh key / agent                   |
 | `/local/path/repo.git` (local)           | none (no credentials needed)           |
 
-If gh isn't logged in for a GitHub remote, `dotgit` runs `gh auth login` for you.
-If a GitLab remote has no token source, it tells you to run `glab auth login` or set
-`GITLAB_TOKEN`.
+If the relevant CLI isn't logged in for the remote's host, `dotgit` starts that CLI's
+login flow for you — `gh auth login` for GitHub, `glab auth login` for GitLab — and
+then pushes. `GITLAB_TOKEN` / `GL_TOKEN` take priority over the `glab` login, so CI
+can push without an interactive session.
+
+Tokens are read per host: a login for `gitlab.com` is never used against
+`gitlab.company.net`, and vice versa.
 
 ## Workflow ideas
 
@@ -212,19 +270,23 @@ Source layout:
 
 ## Troubleshooting
 
-- **`GitHub CLI (gh) is required`** — `gh` isn't installed. `pacman -S github-cli`,
+- **`gh is required`** — `gh` isn't installed. `pacman -S github-cli`,
   `brew install gh`, or download from cli.github.com.
-- **`gh is not authenticated for github.com`** — run `dotgit login` or `gh auth login`.
-- **«glab is not configured»** — run `glab auth login`, or export `GITLAB_TOKEN`.
+- **`glab is required`** — `glab` isn't installed. `pacman -S glab`, `brew install glab`,
+  or download from gitlab.com/gitlab-org/cli.
+- **`gh is not authenticated for <host>`** / **`glab is not authenticated for <host>`** —
+  run `dotgit login <host>`; the message names the exact command.
+- **`glab is not configured`** — run `glab auth login --hostname <host>`, or export
+  `GITLAB_TOKEN`.
 - **`set git user.name and user.email`** — git needs an identity to commit:
   ```bash
   git config --global user.name "You"
   git config --global user.email "you@example.com"
   ```
-- **Push to a brand-new GitHub repo 404s** — the remote doesn't exist yet. Create it:
+- **Push to a brand-new repo 404s** — the remote doesn't exist yet. Let dotgit make
+  it, from inside the repository (it attaches `origin` when there isn't one):
   ```bash
-  git remote add origin https://github.com/you/dotfiles.git
-  gh repo create dotfiles --private --source=. --remote=origin --push
+  dotgit new dotfiles
   ```
 
 ## Performance

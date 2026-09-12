@@ -16,7 +16,7 @@ use error::DotgitError;
 #[command(
     name = "dotgit",
     version,
-    about = "dotfile manager backed by git + gh auth"
+    about = "dotfile manager backed by git + gh/glab auth"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -39,10 +39,33 @@ enum CliCommand {
         #[arg(long)]
         no_push: bool,
     },
-    /// Log into a host via gh and configure git to use it as credential helper
-    Login {
-        /// Host to log into (default: github.com)
+    /// Create a new repository on GitHub or GitLab and wire it up locally
+    New {
+        /// Repository name (may include an owner/namespace, e.g. me/dotfiles)
+        name: String,
+        /// Create it on GitHub without asking
+        #[arg(long, conflicts_with = "gitlab")]
+        github: bool,
+        /// Create it on GitLab without asking
+        #[arg(long, conflicts_with = "github")]
+        gitlab: bool,
+        /// Make the repository public (default: private)
+        #[arg(long)]
+        public: bool,
+        /// Host to create it on (default: github.com / gitlab.com)
+        #[arg(long)]
         host: Option<String>,
+    },
+    /// Log into a host via gh or glab so dotgit can push as you
+    Login {
+        /// Host to log into (default: github.com, or gitlab.com with --gitlab)
+        host: Option<String>,
+        /// Use the GitHub CLI (gh)
+        #[arg(long, conflicts_with = "gitlab")]
+        github: bool,
+        /// Use the GitLab CLI (glab)
+        #[arg(long, conflicts_with = "github")]
+        gitlab: bool,
     },
 }
 
@@ -51,7 +74,18 @@ fn main() {
     let result = match cli.command {
         CliCommand::Upload { paths } => upload(&paths),
         CliCommand::Commit { message, no_push } => commit(message, no_push),
-        CliCommand::Login { host } => login(host.as_deref()),
+        CliCommand::New {
+            name,
+            github,
+            gitlab,
+            public,
+            host,
+        } => new_repo(&name, github, gitlab, public, host.as_deref()),
+        CliCommand::Login {
+            host,
+            github,
+            gitlab,
+        } => login(host.as_deref(), github, gitlab),
     };
     if let Err(err) = result {
         eprintln!("dotgit: {err:#}");
@@ -172,24 +206,7 @@ fn push(repo: &git2::Repository) -> Result<()> {
     if git::remote_is_http(&url) {
         let host = git::host_of(&url)
             .ok_or_else(|| DotgitError::from(format!("cannot parse remote URL: {url}")))?;
-        let credentials = if is_gitlab(&host) {
-            let token = match env::var("GITLAB_TOKEN").or_else(|_| env::var("GL_TOKEN")) {
-                Ok(token) => token,
-                Err(_) => gh::read_glab_credentials()?.token,
-            };
-            gh::HostCredentials {
-                username: "oauth2".into(),
-                token,
-            }
-        } else {
-            if is_github(&host) {
-                gh::ensure_gh()?;
-                if !gh::is_logged_in(&host) {
-                    gh::login(&host)?;
-                }
-            }
-            gh::read_host_credentials(&host)?
-        };
+        let credentials = host_credentials(&host)?;
         let username = credentials.username.clone();
         git::push(repo, &branch, Some(credentials))?;
         println!("pushed to {host} as {username}");
@@ -202,26 +219,149 @@ fn push(repo: &git2::Repository) -> Result<()> {
     Ok(())
 }
 
-/// Match the host label, not any substring: `gitlab.example.com` is GitLab but
-/// `my-gitlab-mirror.example.com` should not be assumed to be.
-fn is_gitlab(host: &str) -> bool {
-    host_labels(host).any(|label| label == "gitlab")
+/// Find a token for `host`, logging in through that forge's CLI if there isn't
+/// one yet. An unrecognised host gets whatever `gh` happens to hold for it,
+/// since that is where a self-hosted GitHub Enterprise login would land.
+fn host_credentials(host: &str) -> Result<gh::HostCredentials> {
+    if let Some(forge) = gh::forge_for_host(host) {
+        // An exported token wins over the CLIs: it is the documented escape
+        // hatch for CI, where no interactive login is possible.
+        if forge == gh::Forge::GitLab {
+            if let Ok(token) = env::var("GITLAB_TOKEN").or_else(|_| env::var("GL_TOKEN")) {
+                return Ok(gh::HostCredentials {
+                    username: "oauth2".into(),
+                    token,
+                });
+            }
+        }
+        gh::ensure_forge_auth(forge, host)?;
+        return match forge {
+            gh::Forge::GitHub => gh::read_host_credentials(host),
+            gh::Forge::GitLab => gh::read_glab_credentials(host),
+        };
+    }
+    gh::read_host_credentials(host)
 }
 
-fn is_github(host: &str) -> bool {
-    host_labels(host).any(|label| label == "github")
-}
+fn new_repo(
+    name: &str,
+    github: bool,
+    gitlab: bool,
+    public: bool,
+    host: Option<&str>,
+) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(DotgitError::from("repository name cannot be empty").into());
+    }
+    let forge = match forge_from_flags(github, gitlab) {
+        Some(forge) => forge,
+        None => prompt_forge()?,
+    };
+    let host = host.unwrap_or_else(|| forge.default_host());
 
-fn host_labels(host: &str) -> impl Iterator<Item = &str> {
-    host.split('.')
-}
+    // Authenticate before creating anything, so a login failure leaves no
+    // half-made repository behind.
+    gh::ensure_forge_auth(forge, host)?;
 
-fn login(host: Option<&str>) -> Result<()> {
-    let host = host.unwrap_or("github.com");
-    gh::ensure_gh()?;
-    gh::login(host)?;
-    println!("logged in as gh user; dotgit will push as this account");
+    let url = gh::create_repo(forge, host, name, !public)?;
+    println!(
+        "created {} repository {name} ({})",
+        forge.label(),
+        if public { "public" } else { "private" }
+    );
+
+    let workdir = attach_local_repo(name, &url)?;
+    println!("origin -> {url}");
+    println!("local repository: {}", workdir.display());
+    println!(
+        "next: cd {} && dotgit upload ~/.config/... && dotgit commit",
+        workdir.display()
+    );
     Ok(())
+}
+
+/// Use the repository we are standing in when it has no `origin` yet;
+/// otherwise start a fresh one in a directory named after the repository.
+fn attach_local_repo(name: &str, url: &str) -> Result<PathBuf> {
+    if let Ok(repo) = git::open_repo() {
+        if repo.find_remote("origin").is_err() {
+            let workdir = git::repo_workdir(&repo)?;
+            git::set_origin(&repo, url)?;
+            return Ok(workdir);
+        }
+    }
+    let dir = env::current_dir()?.join(local_dir_name(name));
+    if dir.exists() {
+        return Err(anyhow!(
+            "{} already exists; the remote was created, point a repository at {url} yourself",
+            dir.display()
+        ));
+    }
+    git::init_with_remote(&dir, url)?;
+    Ok(dir)
+}
+
+/// `me/dotfiles` lives in a directory called `dotfiles`, not `me/dotfiles`.
+fn local_dir_name(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+fn prompt_forge() -> Result<gh::Forge> {
+    let mut input = String::new();
+    loop {
+        print!("Where should this repository live? [1] GitHub  [2] GitLab: ");
+        io::stdout().flush()?;
+        input.clear();
+        if io::stdin().read_line(&mut input)? == 0 {
+            return Err(DotgitError::from("no choice made; pass --github or --gitlab").into());
+        }
+        match parse_forge_choice(&input) {
+            Some(forge) => return Ok(forge),
+            None => eprintln!("please answer 1/github or 2/gitlab"),
+        }
+    }
+}
+
+fn parse_forge_choice(input: &str) -> Option<gh::Forge> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "1" | "gh" | "github" => Some(gh::Forge::GitHub),
+        "2" | "gl" | "glab" | "gitlab" => Some(gh::Forge::GitLab),
+        _ => None,
+    }
+}
+
+fn login(host: Option<&str>, github: bool, gitlab: bool) -> Result<()> {
+    let forge = forge_from_flags(github, gitlab);
+    // An explicit host names its own forge (`dotgit login gitlab.company` needs
+    // glab), so only fall back to the flag default when it doesn't.
+    let (forge, host) = match host {
+        Some(host) => (
+            forge
+                .or_else(|| gh::forge_for_host(host))
+                .unwrap_or_default(),
+            host.to_string(),
+        ),
+        None => {
+            let forge = forge.unwrap_or_default();
+            (forge, forge.default_host().to_string())
+        }
+    };
+    gh::ensure_cli(forge)?;
+    gh::forge_login(forge, &host)?;
+    println!(
+        "logged in to {host} via {}; dotgit will push as this account",
+        forge.cli()
+    );
+    Ok(())
+}
+
+fn forge_from_flags(github: bool, gitlab: bool) -> Option<gh::Forge> {
+    match (github, gitlab) {
+        (true, _) => Some(gh::Forge::GitHub),
+        (_, true) => Some(gh::Forge::GitLab),
+        _ => None,
+    }
 }
 
 fn destination(root: &Path, abs: &Path) -> Result<PathBuf> {
@@ -316,12 +456,42 @@ mod tests {
 
     #[test]
     fn recognises_hosts_by_label_not_substring() {
-        assert!(is_github("github.com"));
-        assert!(is_gitlab("gitlab.com"));
-        assert!(is_gitlab("gitlab.example.com"));
+        assert_eq!(gh::forge_for_host("github.com"), Some(gh::Forge::GitHub));
+        assert_eq!(gh::forge_for_host("gitlab.com"), Some(gh::Forge::GitLab));
+        assert_eq!(
+            gh::forge_for_host("gitlab.example.com"),
+            Some(gh::Forge::GitLab)
+        );
         // A host that merely contains the name must not be misrouted.
-        assert!(!is_gitlab("my-gitlab-mirror.example.com"));
-        assert!(!is_github("github-enterprise-proxy.example.com"));
+        assert_eq!(gh::forge_for_host("my-gitlab-mirror.example.com"), None);
+        assert_eq!(
+            gh::forge_for_host("github-enterprise-proxy.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn flags_pick_the_forge_and_neither_flag_leaves_it_open() {
+        assert_eq!(forge_from_flags(true, false), Some(gh::Forge::GitHub));
+        assert_eq!(forge_from_flags(false, true), Some(gh::Forge::GitLab));
+        assert_eq!(forge_from_flags(false, false), None);
+    }
+
+    #[test]
+    fn accepts_either_number_or_name_for_the_forge_prompt() {
+        assert_eq!(parse_forge_choice("1\n"), Some(gh::Forge::GitHub));
+        assert_eq!(parse_forge_choice(" GitHub \n"), Some(gh::Forge::GitHub));
+        assert_eq!(parse_forge_choice("2"), Some(gh::Forge::GitLab));
+        assert_eq!(parse_forge_choice("gitlab"), Some(gh::Forge::GitLab));
+        assert_eq!(parse_forge_choice(""), None);
+        assert_eq!(parse_forge_choice("bitbucket"), None);
+    }
+
+    #[test]
+    fn strips_the_namespace_from_the_local_directory_name() {
+        assert_eq!(local_dir_name("dotfiles"), "dotfiles");
+        assert_eq!(local_dir_name("me/dotfiles"), "dotfiles");
+        assert_eq!(local_dir_name("group/sub/dotfiles"), "dotfiles");
     }
 
     #[test]

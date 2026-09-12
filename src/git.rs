@@ -155,6 +155,28 @@ pub fn push_ssh(repo: &Repository, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Create a repository at `path` (or adopt one already there) and point its
+/// `origin` at `url`. New repositories start on `main`, matching the default
+/// branch both gh and glab give a freshly created remote.
+pub fn init_with_remote(path: &Path, url: &str) -> Result<()> {
+    let mut options = git2::RepositoryInitOptions::new();
+    options.initial_head("main");
+    let repo = Repository::init_opts(path, &options)
+        .map_err(|e| anyhow!("cannot initialise {}: {e}", path.display()))?;
+    set_origin(&repo, url)?;
+    Ok(())
+}
+
+/// Point `origin` at `url`, replacing any existing remote of that name.
+pub fn set_origin(repo: &Repository, url: &str) -> Result<()> {
+    if repo.find_remote("origin").is_ok() {
+        repo.remote_set_url("origin", url)?;
+    } else {
+        repo.remote("origin", url)?;
+    }
+    Ok(())
+}
+
 pub fn repo_workdir(repo: &Repository) -> Result<PathBuf> {
     repo.workdir()
         .map(PathBuf::from)
