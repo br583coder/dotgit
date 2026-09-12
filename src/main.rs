@@ -39,6 +39,11 @@ enum CliCommand {
         #[arg(long)]
         no_push: bool,
     },
+    /// Revert a commit and push the resulting commit
+    Revert {
+        /// Commit or revision to revert (prompts with recent commits if omitted)
+        commit: Option<String>,
+    },
     /// Create a new repository on GitHub or GitLab and wire it up locally
     New {
         /// Repository name (may include an owner/namespace, e.g. me/dotfiles)
@@ -49,9 +54,12 @@ enum CliCommand {
         /// Create it on GitLab without asking
         #[arg(long, conflicts_with = "github")]
         gitlab: bool,
-        /// Make the repository public (default: private)
-        #[arg(long)]
+        /// Make the repository public
+        #[arg(long, conflicts_with = "private")]
         public: bool,
+        /// Make the repository private
+        #[arg(long, conflicts_with = "public")]
+        private: bool,
         /// Host to create it on (default: github.com / gitlab.com)
         #[arg(long)]
         host: Option<String>,
@@ -74,13 +82,15 @@ fn main() {
     let result = match cli.command {
         CliCommand::Upload { paths } => upload(&paths),
         CliCommand::Commit { message, no_push } => commit(message, no_push),
+        CliCommand::Revert { commit } => revert(commit),
         CliCommand::New {
             name,
             github,
             gitlab,
             public,
+            private,
             host,
-        } => new_repo(&name, github, gitlab, public, host.as_deref()),
+        } => new_repo(&name, github, gitlab, public, private, host.as_deref()),
         CliCommand::Login {
             host,
             github,
@@ -190,6 +200,30 @@ fn commit(message: Option<String>, no_push: bool) -> Result<()> {
     Ok(())
 }
 
+fn revert(commit: Option<String>) -> Result<()> {
+    let repo = git::open_repo()?;
+    let revision = match commit {
+        Some(commit) if !commit.trim().is_empty() => commit,
+        Some(_) => return Err(anyhow!("commit revision cannot be empty")),
+        None => prompt_revert_commit(&repo)?,
+    };
+    let message = git::revert_commit(&repo, &revision)?;
+    let head = repo.head()?;
+    let new_commit = head.peel_to_commit()?;
+    let id = new_commit.id().to_string();
+    println!(
+        "reverted {} in commit {} on {}",
+        revision,
+        &id[..7.min(id.len())],
+        head.shorthand().unwrap_or("HEAD")
+    );
+    push(&repo)?;
+    if !message.is_empty() {
+        println!("message: {}", message.lines().next().unwrap_or_default());
+    }
+    Ok(())
+}
+
 fn push(repo: &git2::Repository) -> Result<()> {
     let url = git::remote_url(repo)?;
     let branch = git::current_branch(repo)?;
@@ -248,6 +282,7 @@ fn new_repo(
     github: bool,
     gitlab: bool,
     public: bool,
+    private: bool,
     host: Option<&str>,
 ) -> Result<()> {
     let name = name.trim();
@@ -257,6 +292,12 @@ fn new_repo(
     let forge = match forge_from_flags(github, gitlab) {
         Some(forge) => forge,
         None => prompt_forge()?,
+    };
+    let public = match (public, private) {
+        (true, false) => true,
+        (false, true) => false,
+        (false, false) => prompt_visibility()?,
+        (true, true) => unreachable!("clap prevents both visibility flags"),
     };
     let host = host.unwrap_or_else(|| forge.default_host());
 
@@ -328,6 +369,64 @@ fn parse_forge_choice(input: &str) -> Option<gh::Forge> {
         "1" | "gh" | "github" => Some(gh::Forge::GitHub),
         "2" | "gl" | "glab" | "gitlab" => Some(gh::Forge::GitLab),
         _ => None,
+    }
+}
+
+fn prompt_visibility() -> Result<bool> {
+    let mut input = String::new();
+    loop {
+        print!("Repository visibility? [1] Public  [2] Private: ");
+        io::stdout().flush()?;
+        input.clear();
+        if io::stdin().read_line(&mut input)? == 0 {
+            return Err(anyhow!("no visibility chosen; pass --public or --private"));
+        }
+        match parse_visibility_choice(&input) {
+            Some(public) => return Ok(public),
+            None => eprintln!("please answer 1/public or 2/private"),
+        }
+    }
+}
+
+fn parse_visibility_choice(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "1" | "public" | "pub" => Some(true),
+        "2" | "private" | "priv" => Some(false),
+        _ => None,
+    }
+}
+
+fn prompt_revert_commit(repo: &git2::Repository) -> Result<String> {
+    let commits = git::recent_commits(repo, 10)?;
+    if commits.is_empty() {
+        return Err(anyhow!("repository has no commits to revert"));
+    }
+    println!("Choose a commit to revert:");
+    for (index, (id, message)) in commits.iter().enumerate() {
+        println!(
+            "  {}. {} {}",
+            index + 1,
+            &id.to_string()[..7],
+            message.lines().next().unwrap_or_default()
+        );
+    }
+    let mut input = String::new();
+    loop {
+        print!("Commit number or revision: ");
+        io::stdout().flush()?;
+        input.clear();
+        if io::stdin().read_line(&mut input)? == 0 {
+            return Err(anyhow!("no commit chosen"));
+        }
+        let choice = input.trim();
+        if let Ok(number) = choice.parse::<usize>() {
+            if let Some((id, _)) = commits.get(number.saturating_sub(1)) {
+                return Ok(id.to_string());
+            }
+        } else if !choice.is_empty() && repo.revparse_single(choice).is_ok() {
+            return Ok(choice.to_string());
+        }
+        eprintln!("choose a listed number or a valid commit revision");
     }
 }
 
@@ -485,6 +584,15 @@ mod tests {
         assert_eq!(parse_forge_choice("gitlab"), Some(gh::Forge::GitLab));
         assert_eq!(parse_forge_choice(""), None);
         assert_eq!(parse_forge_choice("bitbucket"), None);
+    }
+
+    #[test]
+    fn parses_visibility_choices() {
+        assert_eq!(parse_visibility_choice("1"), Some(true));
+        assert_eq!(parse_visibility_choice("public"), Some(true));
+        assert_eq!(parse_visibility_choice("2"), Some(false));
+        assert_eq!(parse_visibility_choice("private"), Some(false));
+        assert_eq!(parse_visibility_choice("maybe"), None);
     }
 
     #[test]

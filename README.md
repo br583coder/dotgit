@@ -15,7 +15,11 @@ you already logged into.
 - **Passwordless** — never stores or asks for credentials; reuses your `gh` / `glab` /
   GitLab token logins.
 - **Creates the repo for you** — `dotgit new <name>` asks whether you want it on
-  GitHub or GitLab, drives `gh`/`glab auth login` when needed, and wires up `origin`.
+  GitHub or GitLab, asks whether it should be public or private, drives `gh`/`glab
+  auth login` when needed, and wires up `origin`.
+- **Revert safely** — `dotgit revert` lets you choose a recent commit (or accepts a
+  revision directly), creates a normal revert commit, and pushes through the same
+  GitHub/GitLab-aware authentication.
 - **Upload anything** — files or whole folders, including hidden/gitignored files
   (uploads are force-added).
 - **Incremental** — re-uploading a folder copies only what actually changed, so
@@ -84,7 +88,7 @@ themselves when the host you are talking to has no credentials yet.
 ## Quick start
 
 ```bash
-# 1. Create the repository (you'll be asked GitHub or GitLab)
+# 1. Create the repository (you'll be asked GitHub/GitLab and public/private)
 dotgit new mydotfiles
 
 # 2. Upload a folder from your machine into the repo
@@ -102,11 +106,13 @@ That's it. Every future edit lives at `~/.config/hypr`; upload + commit to sync.
 ### `dotgit new <name>`
 
 Creates a repository on GitHub or GitLab and sets it up locally. With no `--github`
-or `--gitlab` flag it asks which one you want:
+or `--gitlab` flag it asks which one you want, then asks whether the repository
+should be public or private:
 
 ```
 $ dotgit new mydotfiles
 Where should this repository live? [1] GitHub  [2] GitLab: 1
+Repository visibility? [1] Public  [2] Private: 2
 created GitHub repository mydotfiles (private)
 origin -> https://github.com/octocat/mydotfiles
 local repository: /home/you/mydotfiles
@@ -121,13 +127,13 @@ login never leaves a half-made repository behind.
 
 ```
 dotgit new mydotfiles                    # ask which forge
-dotgit new mydotfiles --github           # skip the prompt
+dotgit new mydotfiles --github --private  # skip both prompts
 dotgit new mydotfiles --gitlab --public  # public GitLab project
 dotgit new me/mydotfiles --gitlab        # create under a namespace/group
 dotgit new dots --github --host github.company.com
 ```
 
-Repositories are **private** unless you pass `--public`. A name with a namespace
+Use `--public` or `--private` to skip the visibility prompt. A name with a namespace
 (`me/dots`) creates the local directory as `dots`.
 
 Where the local repository ends up:
@@ -194,6 +200,20 @@ pushed to github.com as octocat
 
 If nothing changed, it prints `nothing to commit, working tree clean` and simply
 pushes. An empty message aborts.
+
+### `dotgit revert [commit]`
+
+Creates a new commit that reverses an earlier commit, then pushes it to the
+repository's GitHub or GitLab remote. Without a revision, dotgit lists the ten most
+recent commits and lets you choose one:
+
+```
+dotgit revert              # choose from recent commits
+dotgit revert HEAD~1       # revert a specific revision
+```
+
+If the revert conflicts, dotgit leaves the conflict in the working tree and tells
+you to resolve and commit it manually.
 
 ### `dotgit login [host]`
 

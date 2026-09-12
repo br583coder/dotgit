@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
-use git2::{Cred, IndexAddOption, PushOptions, RemoteCallbacks, Repository};
+use git2::{Cred, IndexAddOption, Oid, PushOptions, RemoteCallbacks, Repository};
 
 use crate::error::DotgitError;
 
@@ -65,6 +65,53 @@ pub fn create_commit(repo: &Repository, message: &str) -> Result<bool> {
         &parents,
     )?;
     Ok(true)
+}
+
+pub fn recent_commits(repo: &Repository, limit: usize) -> Result<Vec<(Oid, String)>> {
+    let mut walk = repo.revwalk()?;
+    walk.push_head()?;
+    let mut commits = Vec::new();
+    for oid in walk.take(limit) {
+        let oid = oid?;
+        let commit = repo.find_commit(oid)?;
+        commits.push((oid, commit.summary().unwrap_or("(no message)").to_string()));
+    }
+    Ok(commits)
+}
+
+pub fn revert_commit(repo: &Repository, revision: &str) -> Result<String> {
+    let target = repo
+        .revparse_single(revision)
+        .with_context(|| format!("cannot find commit '{revision}'"))?
+        .peel_to_commit()
+        .with_context(|| format!("'{revision}' is not a commit"))?;
+    let mut options = git2::RevertOptions::new();
+    repo.revert(&target, Some(&mut options))?;
+
+    let mut index = repo.index()?;
+    if index.has_conflicts() {
+        return Err(anyhow!(
+            "reverting {revision} produced conflicts; resolve them and commit manually"
+        ));
+    }
+    index.write()?;
+    let tree_id = index.write_tree()?;
+    let tree = repo.find_tree(tree_id)?;
+    let head = repo.head()?.peel_to_commit()?;
+    let signature = repo
+        .signature()
+        .context("set git user.name and git user.email to commit")?;
+    let subject = target.summary().unwrap_or("commit");
+    let message = format!("Revert \"{subject}\"");
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        &message,
+        &tree,
+        &[&head],
+    )?;
+    Ok(message)
 }
 
 pub fn remote_url(repo: &Repository) -> Result<String> {
