@@ -9,3 +9,9 @@ clap = { version = "4", features = ["derive"] }
 dirs = "5"
 git2 = "0.19"
 thiserror = "2"
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

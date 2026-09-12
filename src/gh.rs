@@ -20,9 +20,7 @@ pub struct GlabHost {
 pub fn read_glab_credentials() -> Result<GlabHost> {
     let path = glab_config_path()?;
     let yaml = fs::read_to_string(&path).map_err(|_| {
-        DotgitError::from(
-            "glab is not configured; run `glab auth login` (or set GITLAB_TOKEN)",
-        )
+        DotgitError::from("glab is not configured; run `glab auth login` (or set GITLAB_TOKEN)")
     })?;
     let mut token = None;
     for raw in yaml.lines() {
@@ -53,10 +51,9 @@ fn glab_config_path() -> Result<PathBuf> {
 pub fn ensure_gh() -> Result<()> {
     match Command::new("gh").arg("--version").output() {
         Ok(out) if out.status.success() => Ok(()),
-        _ => Err(DotgitError::GhUnavailable(
-            "install it from https://cli.github.com".into(),
-        )
-        .into()),
+        _ => {
+            Err(DotgitError::GhUnavailable("install it from https://cli.github.com".into()).into())
+        }
     }
 }
 
@@ -84,9 +81,8 @@ pub fn login(host: &str) -> Result<()> {
 
 pub fn read_host_credentials(host: &str) -> Result<HostCredentials> {
     let path = hosts_file_path()?;
-    let yaml = fs::read_to_string(&path).map_err(|_| {
-        anyhow!(DotgitError::GhNotAuthenticated(host.to_string()))
-    })?;
+    let yaml = fs::read_to_string(&path)
+        .map_err(|_| anyhow!(DotgitError::GhNotAuthenticated(host.to_string())))?;
     match parse_host_block(&yaml, host) {
         Some(creds) => Ok(creds),
         None => Err(DotgitError::GhNotAuthenticated(host.to_string()).into()),
@@ -128,4 +124,37 @@ fn parse_host_block(yaml: &str, host: &str) -> Option<HostCredentials> {
         username: user.unwrap_or_else(|| "git".to_string()),
         token: token?,
     })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOSTS: &str = "\
+github.com:
+    user: octocat
+    oauth_token: gho_github_token
+    git_protocol: https
+gitlab.example.com:
+    user: tanuki
+    oauth_token: glpat_other_token
+";
+
+    #[test]
+    fn reads_the_requested_host_block() {
+        let creds = parse_host_block(HOSTS, "github.com").unwrap();
+        assert_eq!(creds.username, "octocat");
+        assert_eq!(creds.token, "gho_github_token");
+    }
+
+    #[test]
+    fn does_not_leak_tokens_between_host_blocks() {
+        let creds = parse_host_block(HOSTS, "gitlab.example.com").unwrap();
+        assert_eq!(creds.username, "tanuki");
+        assert_eq!(creds.token, "glpat_other_token");
+    }
+
+    #[test]
+    fn returns_nothing_for_an_unknown_host() {
+        assert!(parse_host_block(HOSTS, "codeberg.org").is_none());
+    }
 }

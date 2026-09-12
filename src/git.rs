@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
-use git2::{Cred, PushOptions, RemoteCallbacks, Repository, Status, StatusOptions};
+use git2::{Cred, IndexAddOption, PushOptions, RemoteCallbacks, Repository};
 
 use crate::error::DotgitError;
 
@@ -10,62 +10,45 @@ pub fn open_repo() -> Result<Repository> {
     Repository::discover(".").map_err(|_| anyhow::Error::new(DotgitError::NotARepository))
 }
 
-pub fn force_add(repo: &Repository, rel: &Path) -> Result<()> {
+/// Stage uploaded paths, ignoring `.gitignore` - a dotfiles repo should hold
+/// whatever you explicitly told it to hold.
+///
+/// All paths go through a single `add_all` so libgit2 walks the tree once and
+/// the index is written once, however many paths were uploaded.
+pub fn force_add(repo: &Repository, paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
     let mut index = repo.index()?;
-    add_path_recursive(&mut index, rel)?;
+    index.add_all(paths, IndexAddOption::FORCE, None)?;
     index.write()?;
     Ok(())
 }
 
-fn add_path_recursive(index: &mut git2::Index, rel: &Path) -> Result<()> {
-    if rel.is_dir() {
-        for entry in std::fs::read_dir(rel)? {
-            add_path_recursive(index, &entry?.path())?;
-        }
-    } else {
-        index.add_path(rel)?;
-    }
-    Ok(())
-}
-
-pub fn stage_all(repo: &Repository) -> Result<()> {
-    let mut index = repo.index()?;
-    let statuses = repo.statuses(Some(&mut stage_options()))?;
-    for entry in statuses.iter() {
-        let path = Path::new(entry.path().unwrap_or_default());
-        let status = entry.status();
-        if status
-            .intersects(Status::WT_DELETED | Status::INDEX_DELETED)
-            || !path.exists()
-        {
-            index.remove_path(path)?;
-        } else {
-            index.add_path(path)?;
-        }
-    }
-    index.write()?;
+/// Stage every change in the working tree, the way `git add -A` does:
+/// `add_all` picks up new and modified files, `update_all` records deletions.
+fn stage_all(index: &mut git2::Index) -> Result<()> {
+    index.add_all(["*"], IndexAddOption::DEFAULT, None)?;
+    index.update_all(["*"], None)?;
     Ok(())
 }
 
 pub fn create_commit(repo: &Repository, message: &str) -> Result<bool> {
-    stage_all(repo)?;
     let mut index = repo.index()?;
+    stage_all(&mut index)?;
+    index.write()?;
     let tree_id = index.write_tree()?;
     let tree = repo.find_tree(tree_id)?;
 
     let parent_commit = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
-    let head_tree = parent_commit
-        .as_ref()
-        .and_then(|c| c.tree().ok());
+    let head_tree = parent_commit.as_ref().and_then(|c| c.tree().ok());
 
-    let staged = match (&parent_commit, &head_tree) {
-        (Some(_), Some(head_tree)) => {
-            let diff = repo.diff_tree_to_tree(Some(head_tree), Some(&tree), None)?;
-            diff.deltas().next().is_some()
-        }
-        _ => true,
+    let changed = match head_tree {
+        // Comparing tree ids is enough: equal trees mean an empty commit.
+        Some(head_tree) => head_tree.id() != tree.id(),
+        None => true,
     };
-    if !staged {
+    if !changed {
         return Ok(false);
     }
 
@@ -73,7 +56,14 @@ pub fn create_commit(repo: &Repository, message: &str) -> Result<bool> {
         .signature()
         .context("set git user.name and user.email to commit")?;
     let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
-    repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parents)?;
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        message,
+        &tree,
+        &parents,
+    )?;
     Ok(true)
 }
 
@@ -109,20 +99,29 @@ pub fn remote_is_http(url: &str) -> bool {
 }
 
 pub fn host_of(url: &str) -> Option<String> {
-    let rest = if let Some(idx) = url.find("://") {
-        &url[idx + 3..]
-    } else if let Some(at) = url.find('@') {
-        &url[at + 1..]
-    } else {
-        url
+    // Strip the scheme, then the authority, then any `user@` and `:port`, so
+    // both `ssh://git@host:22/x` and `git@host:x` yield `host`.
+    let rest = match url.find("://") {
+        Some(idx) => &url[idx + 3..],
+        None => url,
     };
-    rest.split('/')
+    let authority = rest.split('/').next().unwrap_or_default();
+    let authority = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    authority
+        .split(':')
         .next()
-        .map(|h| h.split(':').next().unwrap_or_default().to_string())
         .filter(|h| !h.is_empty())
+        .map(str::to_string)
 }
 
-pub fn push(repo: &Repository, branch: &str, credentials: Option<crate::gh::HostCredentials>) -> Result<()> {
+pub fn push(
+    repo: &Repository,
+    branch: &str,
+    credentials: Option<crate::gh::HostCredentials>,
+) -> Result<()> {
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
     let mut remote = repo.find_remote("origin")?;
     let mut options = PushOptions::new();
@@ -156,17 +155,43 @@ pub fn push_ssh(repo: &Repository, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn stage_options() -> StatusOptions {
-    let mut options = StatusOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .update_index(true);
-    options
-}
-
 pub fn repo_workdir(repo: &Repository) -> Result<PathBuf> {
     repo.workdir()
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("repository has no working directory"))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_hosts_from_remote_urls() {
+        assert_eq!(
+            host_of("https://github.com/me/dots.git").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            host_of("git@github.com:me/dots.git").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            host_of("ssh://git@gitlab.com:22/me/dots.git").as_deref(),
+            Some("gitlab.com")
+        );
+        assert_eq!(
+            host_of("http://git.example.com:8080/me/dots.git").as_deref(),
+            Some("git.example.com")
+        );
+    }
+
+    #[test]
+    fn classifies_remote_transports() {
+        assert!(remote_is_ssh("git@github.com:me/dots.git"));
+        assert!(remote_is_ssh("ssh://git@github.com/me/dots.git"));
+        assert!(!remote_is_ssh("https://github.com/me/dots.git"));
+
+        assert!(remote_is_http("https://github.com/me/dots.git"));
+        assert!(remote_is_http("http://example.com/dots.git"));
+        assert!(!remote_is_http("/srv/git/dots.git"));
+    }
 }

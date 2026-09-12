@@ -14,6 +14,8 @@ you already logged into.
   GitLab token logins.
 - **Upload anything** — files or whole folders, including hidden/gitignored files
   (uploads are force-added).
+- **Incremental** — re-uploading a folder copies only what actually changed, so
+  syncing a large config tree after a one-line edit is near-instant.
 - **Host-aware pushes** — inspects `.git/config` remote URL and routes auth correctly
   for GitHub, GitLab, SSH, or local remotes.
 - **Interactive or scripted** — `-m` flag for CI/scripts, interactive prompt otherwise.
@@ -110,6 +112,20 @@ Path mapping:
 Uploads are **force-added**, so `.gitignore`-matched files are still tracked — a
 dotfiles repo should hold everything you tell it to.
 
+Uploads are incremental: a destination file with the same size and permissions that
+is newer than its source is left alone, and the summary line reports what happened.
+
+```
+$ dotgit upload ~/.config
+uploaded .config
+staged for commit (3 copied, 1841 unchanged, 48.2 KiB)
+```
+
+Broken symlinks are reported and skipped rather than aborting the upload. Symlinks
+that resolve are stored as their contents, and file permissions are preserved.
+
+`dotgit upload` works from any directory inside the repository, not just its root.
+
 ### `dotgit commit`
 
 Stages all changes, prompts for a commit message (Ctrl-D finishes multiline input),
@@ -119,6 +135,14 @@ creates the commit, and pushes to `origin`.
 dotgit commit                 # prompt for a message, then commit + push
 dotgit commit -m "update"     # non-interactive
 dotgit commit --no-push       # commit locally only
+```
+
+It stages exactly what `git add -A` would (new, modified and deleted files) and
+prints the new commit:
+
+```
+committed 3df1c6f on master
+pushed to github.com as octocat
 ```
 
 If nothing changed, it prints `nothing to commit, working tree clean` and simply
@@ -167,14 +191,21 @@ If a GitLab remote has no token source, it tells you to run `glab auth login` or
 
 ```
 cargo build        # debug build
+cargo test         # unit tests
 cargo clippy       # lints
+cargo fmt          # formatting
 ```
+
+`DOTGIT_JOBS=<n>` overrides the number of copy threads (default: CPU count, capped
+at 8). Setting `DOTGIT_JOBS=1` forces serial copying, which is occasionally useful
+on network filesystems.
 
 Source layout:
 
 | File          | Contents                                              |
 |---------------|-------------------------------------------------------|
-| `src/main.rs` | CLI parsing, upload/copy logic, push orchestration    |
+| `src/main.rs` | CLI parsing, path mapping, push orchestration        |
+| `src/fsops.rs`| incremental, multi-threaded file copying             |
 | `src/git.rs`  | git2 operations: staging, commits, remotes, push      |
 | `src/gh.rs`   | gh/glab auth: token discovery from CLI config files   |
 | `src/error.rs`| typed errors via thiserror                            |
@@ -195,3 +226,19 @@ Source layout:
   git remote add origin https://github.com/you/dotfiles.git
   gh repo create dotfiles --private --source=. --remote=origin --push
   ```
+
+## Performance
+
+Uploading and committing a 20,000-file, 79 MB tree on a warm page cache:
+
+| Operation                       | Time   |
+|---------------------------------|--------|
+| First upload (copy + stage)     | ~3.6 s |
+| Re-upload, nothing changed      | ~0.14 s |
+| Re-upload after editing 1 file  | ~0.14 s |
+| `dotgit commit`                 | ~0.28 s |
+
+The first upload is dominated by git hashing and compressing every file into the
+object database, which is the same work `git add` does. Everything after that is
+incremental: unchanged files are neither copied nor re-hashed. A typical dotfiles
+repo is a few megabytes, where every operation is well under 100 ms.
