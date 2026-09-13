@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -30,10 +30,10 @@ struct Job {
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<CopyStats> {
     // Only a top-level file needs its parent created here; every file found
     // inside the walk already had its directory created by the walk itself.
-    if src.is_file() {
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)?;
-        }
+    if src.is_file()
+        && let Some(parent) = dst.parent()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     let mut jobs = Vec::new();

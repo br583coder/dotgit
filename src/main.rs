@@ -3,12 +3,13 @@ mod error;
 mod fsops;
 mod gh;
 mod git;
+mod history;
 
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 
 use error::DotgitError;
@@ -65,6 +66,10 @@ enum CliCommand {
         #[arg(long)]
         host: Option<String>,
     },
+    /// Step the working tree back one version (repeat to keep going back)
+    Restore,
+    /// Step the working tree forward one version, towards the newest change
+    Rebase,
     /// Save the full commit history to a local bundle file
     Backup {
         /// Directory or file to write the bundle to
@@ -104,6 +109,8 @@ fn main() {
             private,
             host,
         } => new_repo(&name, github, gitlab, public, private, host.as_deref()),
+        CliCommand::Restore => step_history(history::Direction::Older),
+        CliCommand::Rebase => step_history(history::Direction::Newer),
         CliCommand::Backup { to, list, keep } => backup_cmd(to.as_deref(), list, keep),
         CliCommand::Login {
             host,
@@ -206,6 +213,9 @@ fn commit(message: Option<String>, no_push: bool) -> Result<()> {
         }
         false => println!("nothing to commit, working tree clean"),
     }
+    // The commit just made is the newest version, so any stepped-back cursor
+    // no longer applies.
+    history::clear(&repo)?;
     if no_push {
         println!("skipped push (--no-push)");
         return Ok(());
@@ -274,13 +284,13 @@ fn host_credentials(host: &str) -> Result<gh::HostCredentials> {
     if let Some(forge) = gh::forge_for_host(host) {
         // An exported token wins over the CLIs: it is the documented escape
         // hatch for CI, where no interactive login is possible.
-        if forge == gh::Forge::GitLab {
-            if let Ok(token) = env::var("GITLAB_TOKEN").or_else(|_| env::var("GL_TOKEN")) {
-                return Ok(gh::HostCredentials {
-                    username: "oauth2".into(),
-                    token,
-                });
-            }
+        if forge == gh::Forge::GitLab
+            && let Ok(token) = env::var("GITLAB_TOKEN").or_else(|_| env::var("GL_TOKEN"))
+        {
+            return Ok(gh::HostCredentials {
+                username: "oauth2".into(),
+                token,
+            });
         }
         gh::ensure_forge_auth(forge, host)?;
         return match forge {
@@ -339,12 +349,12 @@ fn new_repo(
 /// Use the repository we are standing in when it has no `origin` yet;
 /// otherwise start a fresh one in a directory named after the repository.
 fn attach_local_repo(name: &str, url: &str) -> Result<PathBuf> {
-    if let Ok(repo) = git::open_repo() {
-        if repo.find_remote("origin").is_err() {
-            let workdir = git::repo_workdir(&repo)?;
-            git::set_origin(&repo, url)?;
-            return Ok(workdir);
-        }
+    if let Ok(repo) = git::open_repo()
+        && repo.find_remote("origin").is_err()
+    {
+        let workdir = git::repo_workdir(&repo)?;
+        git::set_origin(&repo, url)?;
+        return Ok(workdir);
     }
     let dir = env::current_dir()?.join(local_dir_name(name));
     if dir.exists() {
@@ -441,6 +451,66 @@ fn prompt_revert_commit(repo: &git2::Repository) -> Result<String> {
             return Ok(choice.to_string());
         }
         eprintln!("choose a listed number or a valid commit revision");
+    }
+}
+
+/// Move one version older or newer and rewrite the working tree to match.
+fn step_history(direction: history::Direction) -> Result<()> {
+    let repo = git::open_repo()?;
+    let current = history::current(&repo)?;
+
+    // Guard against silently discarding edits. The comparison is against the
+    // version currently checked out, so a step never blocks the next step.
+    if git::has_changes_against(&repo, current.oid)? {
+        return Err(DotgitError::from(
+            "you have uncommitted changes - run `dotgit commit` to keep them, \
+             or `dotgit backup` first if you are unsure",
+        )
+        .into());
+    }
+
+    let next = match history::step(&repo, direction)? {
+        Some(next) => next,
+        None => {
+            println!("{}", boundary_message(direction));
+            return Ok(());
+        }
+    };
+
+    git::checkout_tree_at(&repo, next.oid)?;
+    history::save(&repo, &next)?;
+
+    let (id, subject) = git::describe(&repo, next.oid)?;
+    println!("{} {id} \"{subject}\" ({})", verb(direction), place(&next));
+    if next.is_newest() {
+        println!("this is the newest change");
+    } else {
+        println!("`dotgit rebase` steps forward, `dotgit commit` keeps this version");
+    }
+    Ok(())
+}
+
+fn boundary_message(direction: history::Direction) -> &'static str {
+    match direction {
+        history::Direction::Older => "oldest change reached",
+        history::Direction::Newer => "newest change released",
+    }
+}
+
+fn verb(direction: history::Direction) -> &'static str {
+    match direction {
+        history::Direction::Older => "restored to",
+        history::Direction::Newer => "moved forward to",
+    }
+}
+
+/// How far back from the newest change this version sits.
+fn place(position: &history::Position) -> String {
+    let newest = position.total.saturating_sub(1);
+    match position.index {
+        0 => "newest change".to_string(),
+        1 => format!("1 version back of {newest}"),
+        back => format!("{back} versions back of {newest}"),
     }
 }
 
@@ -660,6 +730,32 @@ mod tests {
         assert_eq!(local_dir_name("dotfiles"), "dotfiles");
         assert_eq!(local_dir_name("me/dotfiles"), "dotfiles");
         assert_eq!(local_dir_name("group/sub/dotfiles"), "dotfiles");
+    }
+
+    #[test]
+    fn reports_where_a_version_sits_in_the_history() {
+        let at = |index, total| {
+            place(&history::Position {
+                oid: git2::Oid::zero(),
+                index,
+                total,
+            })
+        };
+        assert_eq!(at(0, 5), "newest change");
+        assert_eq!(at(1, 5), "1 version back of 4");
+        assert_eq!(at(3, 5), "3 versions back of 4");
+    }
+
+    #[test]
+    fn names_each_end_of_the_history() {
+        assert_eq!(
+            boundary_message(history::Direction::Older),
+            "oldest change reached"
+        );
+        assert_eq!(
+            boundary_message(history::Direction::Newer),
+            "newest change released"
+        );
     }
 
     #[test]

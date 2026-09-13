@@ -12,6 +12,8 @@ you already logged into.
 
 - **GitHub and GitLab as equals** — every command (`new`, `login`, pushing) works the
   same on either, driving `gh` or `glab` as appropriate, including self-hosted hosts.
+- **Step through versions** — `dotgit restore` walks the working tree back one change
+  at a time and `dotgit rebase` walks it forward again, without rewriting history.
 - **Survives the remote being deleted** — `dotgit backup` writes the entire commit
   history to a single local file you can clone from with no network and no forge.
 - **Passwordless** — never stores or asks for credentials; reuses your `gh` / `glab` /
@@ -217,6 +219,66 @@ dotgit revert HEAD~1       # revert a specific revision
 If the revert conflicts, dotgit leaves the conflict in the working tree and tells
 you to resolve and commit it manually.
 
+### `dotgit restore` / `dotgit rebase`
+
+Move the working tree back and forth through the repository's versions, one commit at
+a time. `dotgit restore` goes one change **older**; run it again to keep going back.
+`dotgit rebase` goes one change **newer**, up to the most recent one.
+
+```
+$ dotgit restore
+restored to 82c02c8 "second version" (1 version back of 2)
+`dotgit rebase` steps forward, `dotgit commit` keeps this version
+
+$ dotgit restore
+restored to e20c40a "first version" (2 versions back of 2)
+
+$ dotgit restore
+oldest change reached
+
+$ dotgit rebase
+moved forward to 82c02c8 "second version" (1 version back of 2)
+
+$ dotgit rebase
+moved forward to b2afa86 "third version" (newest change)
+this is the newest change
+
+$ dotgit rebase
+newest change released
+```
+
+**Nothing is ever rewritten or lost.** Stepping changes only the files in the working
+tree; the branch keeps pointing at the newest commit, so every version stays
+reachable and a step in the wrong direction costs nothing — step the other way and
+you are back. `git log` is identical before and after.
+
+The position is remembered in `.git/dotgit-position`, inside the git directory, so it
+is never uploaded, committed or pushed.
+
+**To keep a version you stepped back to**, commit it:
+
+```bash
+dotgit restore          # go back to the version you want
+dotgit commit -m "roll back to yesterday's config"
+```
+
+That records the rollback as a new commit on top, which is why nothing is lost. The
+position resets to the newest change afterwards, since the commit you just made *is*
+now the newest change.
+
+If you have uncommitted edits, stepping refuses rather than overwriting them:
+
+```
+dotgit: you have uncommitted changes - run `dotgit commit` to keep them, or
+`dotgit backup` first if you are unsure
+```
+
+The check is against the version you are currently on, not the newest one, so being
+stepped back never blocks the next step — only your own unsaved edits do.
+
+Note these move files **inside the repository**. Copying them back out to `~` is a
+separate step; `dotgit upload` only ever copies inward.
+
 ### `dotgit backup`
 
 Writes every commit, branch and tag to a single `.bundle` file on your machine, so
@@ -311,6 +373,11 @@ Tokens are read per host: a login for `gitlab.com` is never used against
 
 ## Workflow ideas
 
+- Walk back through configs until something works again, then keep it:
+  ```bash
+  dotgit restore     # repeat until the config is the one that worked
+  dotgit commit -m "back to the working version"
+  ```
 - Take a local snapshot before anything risky (a force-push, a history rewrite, or
   deleting a repo): `dotgit backup` first, and the old history is still on disk.
 - Keep a `dotfiles` repo and re-upload a config whenever you change it:
@@ -357,6 +424,8 @@ Source layout:
   run `dotgit login <host>`; the message names the exact command.
 - **`glab is not configured`** — run `glab auth login --hostname <host>`, or export
   `GITLAB_TOKEN`.
+- **`no commits yet - nothing to step through`** — `dotgit restore` needs at least one
+  commit to step through.
 - **`nothing to back up yet - make a commit first`** — a bundle needs at least one
   commit; `git bundle` cannot record an empty repository.
 - **`set git user.name and user.email`** — git needs an identity to commit:

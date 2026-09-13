@@ -14,7 +14,9 @@ pub enum DotgitError {
     Message(String),
     #[error("{cli} is required: {hint}")]
     CliUnavailable { cli: String, hint: String },
-    #[error("{cli} is not authenticated for {host}; run `dotgit login {host}` or `{cli} auth login --hostname {host}`")]
+    #[error(
+        "{cli} is not authenticated for {host}; run `dotgit login {host}` or `{cli} auth login --hostname {host}`"
+    )]
     NotAuthenticated { cli: String, host: String },
 }
 

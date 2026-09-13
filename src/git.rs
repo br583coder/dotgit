@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use git2::{Cred, IndexAddOption, Oid, PushOptions, RemoteCallbacks, Repository};
 
 use crate::error::DotgitError;
@@ -222,6 +222,46 @@ pub fn set_origin(repo: &Repository, url: &str) -> Result<()> {
         repo.remote("origin", url)?;
     }
     Ok(())
+}
+
+/// Rewrite the working tree (and the index) to match `oid`, leaving the branch
+/// pointer alone.
+///
+/// Checking out the tree rather than the commit is what makes stepping through
+/// versions non-destructive: HEAD keeps pointing at the newest commit, so the
+/// difference shows up as ordinary changes that `dotgit commit` can record, and
+/// no commit ever becomes unreachable.
+pub fn checkout_tree_at(repo: &Repository, oid: git2::Oid) -> Result<()> {
+    let tree = repo.find_commit(oid)?.tree()?;
+    let mut options = git2::build::CheckoutBuilder::new();
+    // `force` overwrites tracked files; untracked files are left where they
+    // are, since they were never part of any version.
+    options.force().update_index(true).remove_untracked(false);
+    repo.checkout_tree(tree.as_object(), Some(&mut options))?;
+    Ok(())
+}
+
+/// Whether the working tree differs from `oid`.
+///
+/// The comparison is against the version currently checked out, not HEAD:
+/// after stepping back, differing from HEAD is the expected state, and only a
+/// difference from the stepped-to version means unsaved work.
+pub fn has_changes_against(repo: &Repository, oid: git2::Oid) -> Result<bool> {
+    let tree = repo.find_commit(oid)?.tree()?;
+    let diff = repo.diff_tree_to_workdir_with_index(Some(&tree), None)?;
+    Ok(diff.deltas().len() > 0)
+}
+
+/// A commit's abbreviated id and subject line, for reporting where we landed.
+pub fn describe(repo: &Repository, oid: git2::Oid) -> Result<(String, String)> {
+    let commit = repo.find_commit(oid)?;
+    let id = commit.id().to_string();
+    let subject = commit
+        .summary()
+        .unwrap_or("(no message)")
+        .trim()
+        .to_string();
+    Ok((id[..7.min(id.len())].to_string(), subject))
 }
 
 pub fn repo_workdir(repo: &Repository) -> Result<PathBuf> {

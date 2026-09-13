@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use git2::Repository;
 
 use crate::error::DotgitError;
@@ -332,8 +332,10 @@ mod tests {
 
     #[test]
     fn listing_a_missing_directory_is_empty_not_an_error() {
-        assert!(list(Path::new("/nonexistent/dotgit/backups"))
-            .unwrap()
-            .is_empty());
+        assert!(
+            list(Path::new("/nonexistent/dotgit/backups"))
+                .unwrap()
+                .is_empty()
+        );
     }
 }
