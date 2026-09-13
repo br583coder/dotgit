@@ -6,7 +6,20 @@ into a GitHub or GitLab repository and commit them without ever typing a passwor
 `dotgit` mirrors dotfiles from your machine into a repo's working tree (paths are
 preserved relative to `$HOME`), stages them, prompts for a commit message, commits,
 and pushes to the platform your remote points at — authenticating with whichever CLI
-you already logged into.
+you already logged into. It also creates the repository for you, steps the working
+tree back and forth through past versions, and keeps an offline copy of the whole
+history in case the remote ever disappears.
+
+| Command                  | What it does                                          |
+|--------------------------|-------------------------------------------------------|
+| `dotgit new <name>`      | create the repo on GitHub or GitLab and wire up `origin` |
+| `dotgit upload <paths>`  | copy files from your machine into the repo and stage them |
+| `dotgit commit`          | stage everything, commit, and push                    |
+| `dotgit restore`         | step the working tree back one version                |
+| `dotgit rebase`          | step the working tree forward one version             |
+| `dotgit revert [commit]` | reverse an earlier commit and push the result         |
+| `dotgit backup`          | save the full history to a local bundle file          |
+| `dotgit login [host]`    | log in through `gh` or `glab`                         |
 
 ## Features
 
@@ -37,7 +50,8 @@ you already logged into.
 
 Requirements:
 
-- [Rust](https://rustup.rs) toolchain (Rust 1.70+)
+- [Rust](https://rustup.rs) 1.88 or newer — the crate is edition 2024 and uses
+  let-chains
 - `git`
 - `gh` for GitHub auth (optional if you only use GitLab)
 - `glab` or a `GITLAB_TOKEN` for GitLab auth (optional for GitHub)
@@ -101,6 +115,9 @@ dotgit upload ~/.config/hypr
 
 # 3. Commit and push (you'll be prompted for a message)
 dotgit commit
+
+# 4. Optional: keep an offline copy of the history
+dotgit backup
 ```
 
 That's it. Every future edit lives at `~/.config/hypr`; upload + commit to sync.
@@ -406,13 +423,15 @@ on network filesystems.
 
 Source layout:
 
-| File          | Contents                                              |
-|---------------|-------------------------------------------------------|
-| `src/main.rs` | CLI parsing, path mapping, push orchestration        |
-| `src/fsops.rs`| incremental, multi-threaded file copying             |
-| `src/git.rs`  | git2 operations: staging, commits, remotes, push      |
-| `src/gh.rs`   | gh/glab auth: token discovery from CLI config files   |
-| `src/error.rs`| typed errors via thiserror                            |
+| File             | Contents                                           |
+|------------------|-----------------------------------------------------|
+| `src/main.rs`    | CLI parsing, path mapping, push orchestration      |
+| `src/fsops.rs`   | incremental, multi-threaded file copying           |
+| `src/git.rs`     | git2 operations: staging, commits, remotes, push   |
+| `src/gh.rs`      | gh/glab auth: token discovery from CLI config files |
+| `src/history.rs` | the version cursor behind `restore` and `rebase`   |
+| `src/backup.rs`  | git bundles: writing, listing and pruning backups  |
+| `src/error.rs`   | typed errors via thiserror                         |
 
 ## Troubleshooting
 
@@ -424,6 +443,9 @@ Source layout:
   run `dotgit login <host>`; the message names the exact command.
 - **`glab is not configured`** — run `glab auth login --hostname <host>`, or export
   `GITLAB_TOKEN`.
+- **`you have uncommitted changes`** on `dotgit restore` / `dotgit rebase` — stepping
+  will not overwrite unsaved edits. Keep them with `dotgit commit`, or discard them
+  with `git checkout -- .`, then step again.
 - **`no commits yet - nothing to step through`** — `dotgit restore` needs at least one
   commit to step through.
 - **`nothing to back up yet - make a commit first`** — a bundle needs at least one
