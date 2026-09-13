@@ -1,3 +1,4 @@
+mod backup;
 mod error;
 mod fsops;
 mod gh;
@@ -64,6 +65,18 @@ enum CliCommand {
         #[arg(long)]
         host: Option<String>,
     },
+    /// Save the full commit history to a local bundle file
+    Backup {
+        /// Directory or file to write the bundle to
+        #[arg(long, value_name = "PATH")]
+        to: Option<PathBuf>,
+        /// List existing backups instead of making one
+        #[arg(long)]
+        list: bool,
+        /// Delete all but the newest N backups after making one
+        #[arg(long, value_name = "N")]
+        keep: Option<usize>,
+    },
     /// Log into a host via gh or glab so dotgit can push as you
     Login {
         /// Host to log into (default: github.com, or gitlab.com with --gitlab)
@@ -91,6 +104,7 @@ fn main() {
             private,
             host,
         } => new_repo(&name, github, gitlab, public, private, host.as_deref()),
+        CliCommand::Backup { to, list, keep } => backup_cmd(to.as_deref(), list, keep),
         CliCommand::Login {
             host,
             github,
@@ -428,6 +442,52 @@ fn prompt_revert_commit(repo: &git2::Repository) -> Result<String> {
         }
         eprintln!("choose a listed number or a valid commit revision");
     }
+}
+
+fn backup_cmd(to: Option<&Path>, list: bool, keep: Option<usize>) -> Result<()> {
+    let dir = match to {
+        Some(path) => path.to_path_buf(),
+        None => backup::default_dir()?,
+    };
+    if list {
+        return list_backups(&dir);
+    }
+
+    let repo = git::open_repo()?;
+    let saved = backup::create(&repo, to)?;
+    println!(
+        "saved {} ({})",
+        saved.path.display(),
+        human_bytes(saved.bytes)
+    );
+
+    if let Some(keep) = keep {
+        // Pruning is scoped to the directory the bundle went into, so a
+        // one-off `--to some/file.bundle` never sweeps a neighbouring folder.
+        let pruned_dir = saved.path.parent().unwrap_or(&dir).to_path_buf();
+        for removed in backup::prune(&pruned_dir, keep.max(1), saved.repo.as_deref())? {
+            println!("removed {}", removed.display());
+        }
+    }
+
+    println!(
+        "restore with: git clone {} <directory>",
+        saved.path.display()
+    );
+    Ok(())
+}
+
+fn list_backups(dir: &Path) -> Result<()> {
+    let backups = backup::list(dir)?;
+    if backups.is_empty() {
+        println!("no backups in {}", dir.display());
+        return Ok(());
+    }
+    for entry in &backups {
+        println!("{}  {}", entry.path.display(), human_bytes(entry.bytes));
+    }
+    println!("{} backup(s) in {}", backups.len(), dir.display());
+    Ok(())
 }
 
 fn login(host: Option<&str>, github: bool, gitlab: bool) -> Result<()> {

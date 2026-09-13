@@ -12,6 +12,8 @@ you already logged into.
 
 - **GitHub and GitLab as equals** — every command (`new`, `login`, pushing) works the
   same on either, driving `gh` or `glab` as appropriate, including self-hosted hosts.
+- **Survives the remote being deleted** — `dotgit backup` writes the entire commit
+  history to a single local file you can clone from with no network and no forge.
 - **Passwordless** — never stores or asks for credentials; reuses your `gh` / `glab` /
   GitLab token logins.
 - **Creates the repo for you** — `dotgit new <name>` asks whether you want it on
@@ -215,6 +217,61 @@ dotgit revert HEAD~1       # revert a specific revision
 If the revert conflicts, dotgit leaves the conflict in the working tree and tells
 you to resolve and commit it manually.
 
+### `dotgit backup`
+
+Writes every commit, branch and tag to a single `.bundle` file on your machine, so
+the history survives the GitHub/GitLab repository being deleted, made private, locked
+out, or lost with the account.
+
+```
+$ dotgit backup
+saved /home/you/.local/share/dotgit/backups/dotfiles-20260912-183000.bundle (36.3 KiB)
+restore with: git clone /home/you/.local/share/dotgit/backups/dotfiles-20260912-183000.bundle <directory>
+```
+
+```
+dotgit backup                      # default location, below
+dotgit backup --to /mnt/usb        # a directory: names the file for you
+dotgit backup --to ~/dots.bundle   # an exact file path
+dotgit backup --list               # what you already have
+dotgit backup --keep 5             # back up, then keep only the 5 newest
+```
+
+Backups default to `$XDG_DATA_HOME/dotgit/backups` (usually
+`~/.local/share/dotgit/backups`) — deliberately **outside** the repository, so
+deleting or re-cloning the repo never takes the backups with it.
+
+Files are named `<repo>-<UTC timestamp>.bundle`, and `--keep` only ever prunes
+backups of the repository you ran it in; another repository's backups in the same
+directory are left alone, as is any bundle you named yourself.
+
+Every bundle is verified with `git bundle verify` immediately after being written, so
+a corrupt backup is an error now rather than a surprise on the day you need it.
+
+**Restoring** needs nothing but git and the file:
+
+```bash
+git clone ~/.local/share/dotgit/backups/dotfiles-20260912-183000.bundle dotfiles
+cd dotfiles
+git log            # full history, every commit
+```
+
+If the remote is gone for good, create a fresh one and push the recovered history:
+
+```bash
+dotgit new dotfiles      # attaches origin to the repo you are standing in
+dotgit commit -m "restore from backup"
+```
+
+A bundle is a normal git remote, so you can also `git fetch` from one into an
+existing repository instead of cloning.
+
+To make it automatic, run it from cron or a systemd timer:
+
+```bash
+0 20 * * * cd ~/dotfiles && dotgit backup --keep 14
+```
+
 ### `dotgit login [host]`
 
 Runs `gh auth login` or `glab auth login` for `<host>` so dotgit can read your token.
@@ -254,6 +311,8 @@ Tokens are read per host: a login for `gitlab.com` is never used against
 
 ## Workflow ideas
 
+- Take a local snapshot before anything risky (a force-push, a history rewrite, or
+  deleting a repo): `dotgit backup` first, and the old history is still on disk.
 - Keep a `dotfiles` repo and re-upload a config whenever you change it:
   ```bash
   dotgit upload ~/.config/hypr && dotgit commit -m "tweak colorscheme"
@@ -298,6 +357,8 @@ Source layout:
   run `dotgit login <host>`; the message names the exact command.
 - **`glab is not configured`** — run `glab auth login --hostname <host>`, or export
   `GITLAB_TOKEN`.
+- **`nothing to back up yet - make a commit first`** — a bundle needs at least one
+  commit; `git bundle` cannot record an empty repository.
 - **`set git user.name and user.email`** — git needs an identity to commit:
   ```bash
   git config --global user.name "You"
