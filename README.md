@@ -55,6 +55,7 @@ Requirements:
 - `git`
 - `gh` for GitHub auth (optional if you only use GitLab)
 - `glab` or a `GITLAB_TOKEN` for GitLab auth (optional for GitHub)
+- C programming language (cc)
 
 Clone and install:
 
