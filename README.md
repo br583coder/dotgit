@@ -70,7 +70,7 @@ Clone and install:
 git clone https://github.com/br583coder/dotgit.git
 cd dotgit
 cargo build --release
-cargo install --path . --force
+cargo install --path . --force --features tui
 ```
 
 That installs `dotgit` and its short alias `dg`. The optional TUI is behind a feature
@@ -91,7 +91,6 @@ To update later:
 ```
 cd ~/dotgit
 git pull
-cargo install --path . --force --features tui
 ```
 
 ## Authentication
