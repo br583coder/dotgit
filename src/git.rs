@@ -164,12 +164,16 @@ pub fn host_of(url: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Push `branch` to `origin`. A forced push leads the refspec with `+`, which
+/// is what lets the remote lose commits that the local branch no longer has.
 pub fn push(
     repo: &Repository,
     branch: &str,
     credentials: Option<crate::gh::HostCredentials>,
+    force: bool,
 ) -> Result<()> {
-    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    let lead = if force { "+" } else { "" };
+    let refspec = format!("{lead}refs/heads/{branch}:refs/heads/{branch}");
     let mut remote = repo.find_remote("origin")?;
     let mut options = PushOptions::new();
     if let Some(creds) = credentials {
@@ -186,11 +190,19 @@ pub fn push(
     Ok(())
 }
 
-pub fn push_ssh(repo: &Repository, branch: &str) -> Result<()> {
-    let status = Command::new("git")
+pub fn push_ssh(repo: &Repository, branch: &str, force: bool) -> Result<()> {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
-        .arg(repo.path().parent().unwrap_or(Path::new(".")))
-        .args(["push", "origin", branch])
+        .arg(repo.path().parent().unwrap_or(Path::new(".")));
+    if force {
+        // `--force-with-lease` still refuses if the remote moved in a way we
+        // have not seen, which a bare `--force` would happily overwrite.
+        command.args(["push", "--force-with-lease", "origin", branch]);
+    } else {
+        command.args(["push", "origin", branch]);
+    }
+    let status = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -262,6 +274,15 @@ pub fn describe(repo: &Repository, oid: git2::Oid) -> Result<(String, String)> {
         .trim()
         .to_string();
     Ok((id[..7.min(id.len())].to_string(), subject))
+}
+
+/// Move the branch to `oid` and make the working tree match it, discarding
+/// everything after it. The commits themselves stay in the object database
+/// until git garbage-collects them, which is what `git reflog` recovers from.
+pub fn reset_hard(repo: &Repository, oid: git2::Oid) -> Result<()> {
+    let object = repo.find_object(oid, None)?;
+    repo.reset(&object, git2::ResetType::Hard, None)?;
+    Ok(())
 }
 
 pub fn repo_workdir(repo: &Repository) -> Result<PathBuf> {

@@ -18,8 +18,13 @@ history in case the remote ever disappears.
 | `dotgit restore`         | step the working tree back one version                |
 | `dotgit rebase`          | step the working tree forward one version             |
 | `dotgit revert [commit]` | reverse an earlier commit and push the result         |
+| `dotgit pull`            | destroy the newest commit, locally and on the remote   |
 | `dotgit backup`          | save the full history to a local bundle file          |
 | `dotgit login [host]`    | log in through `gh` or `glab`                         |
+
+An optional full-screen browser, [`dotgit-tui`](#dotgit-tui-optional), is available
+separately. You never need it: it is a different binary, it is not built or installed
+by default, and the `dotgit` command never launches it.
 
 ## Features
 
@@ -27,6 +32,8 @@ history in case the remote ever disappears.
   same on either, driving `gh` or `glab` as appropriate, including self-hosted hosts.
 - **Step through versions** — `dotgit restore` walks the working tree back one change
   at a time and `dotgit rebase` walks it forward again, without rewriting history.
+- **Undo a bad commit for good** — `dotgit pull` destroys the newest commit locally
+  and on the remote, after backing the history up so it stays recoverable.
 - **Survives the remote being deleted** — `dotgit backup` writes the entire commit
   history to a single local file you can clone from with no network and no forge.
 - **Passwordless** — never stores or asks for credentials; reuses your `gh` / `glab` /
@@ -66,11 +73,18 @@ cargo build --release
 cargo install --path . --force
 ```
 
+That installs `dotgit` and its short alias `dg`. The optional TUI is behind a feature
+flag and is **not** built by this command — see
+[`dotgit-tui`](#dotgit-tui-optional) if you want it.
+
 Verify:
 
 ```
 dotgit --version
+dg --version          # shorthand for dotgit
 ```
+
+After installation, `dg` and `dotgit` are interchangeable commands.
 
 To update later:
 
@@ -124,6 +138,8 @@ dotgit backup
 That's it. Every future edit lives at `~/.config/hypr`; upload + commit to sync.
 
 ## Commands
+
+Every command below can be run with either `dotgit` or its shorter alias `dg`.
 
 ### `dotgit new <name>`
 
@@ -297,6 +313,57 @@ stepped back never blocks the next step — only your own unsaved edits do.
 Note these move files **inside the repository**. Copying them back out to `~` is a
 separate step; `dotgit upload` only ever copies inward.
 
+### `dotgit pull`
+
+Destroys the newest commit **entirely** — locally and on the remote — for when a
+commit is simply wrong and you want it gone rather than reversed.
+
+```
+$ dotgit pull
+About to destroy 1 commit(s):
+  91403b1  broke my waybar config
+HEAD would become dc67826 "version 3"
+the remote will be force-pushed, so it loses them too
+Destroy them? [y/N] y
+backed up first: /home/you/.local/share/dotgit/backups/dotfiles-20260915-020758.bundle
+destroyed 1 commit(s); HEAD is now dc67826 "version 3"
+force-pushed to github.com (the remote no longer has them)
+recover with: git clone <the bundle above> <directory>
+```
+
+```
+dotgit pull                  # destroy the newest commit
+dotgit pull -n 3             # destroy the three newest commits
+dotgit pull -y               # skip the confirmation (for scripts)
+dotgit pull --no-push        # destroy locally, leave the remote alone
+dotgit pull --no-backup      # skip the safety bundle
+dotgit drop                  # an alias, if `pull` reads oddly to you
+```
+
+**This is the one command that deletes work on purpose**, so it is built to be hard
+to regret:
+
+- It prints exactly which commits will go, and what `HEAD` will become, **before**
+  asking. Anything but an explicit `y` cancels.
+- It writes a [backup bundle](#dotgit-backup) first, so every destroyed commit can be
+  cloned back afterwards. `git reflog` also still holds them until git collects them.
+- It refuses when you are [stepped back](#dotgit-restore--dotgit-rebase) through the
+  history, where the result would be hard to predict.
+- It refuses to destroy the entire history; the first commit cannot be removed this
+  way.
+- It warns when uncommitted changes would be destroyed along with the commits.
+- The remote is force-pushed with `--force-with-lease` over SSH, which refuses if the
+  remote moved in a way you have not seen.
+
+**A word on the name.** `dotgit pull` is not `git pull` — it does not fetch anything
+from the remote. It pulls a commit *out* of the history and destroys it. `dotgit drop`
+is an alias for the same thing if that reads better.
+
+If the push fails after the commits are already gone locally, dotgit says so and
+leaves the local history destroyed rather than silently re-creating it. Fix the cause
+(usually a login), then run `git push --force-with-lease origin <branch>` to bring the
+remote into line.
+
 ### `dotgit backup`
 
 Writes every commit, branch and tag to a single `.bundle` file on your machine, so
@@ -368,6 +435,66 @@ dotgit login git.example.com    # gh (GitHub Enterprise is the fallback)
 A host that names neither forge falls back to `gh`, which is where a GitHub
 Enterprise login lives.
 
+## `dotgit-tui` (optional)
+
+A full-screen browser for the repository: the version history on the left, details of
+the selected version on the right, and single keys for the common actions.
+
+**It is entirely optional.** It is a separate binary, it is not built or installed
+unless you ask for it, and the `dotgit` command never launches it — there is no `tui`
+subcommand and nothing in the CLI depends on it. Every action it offers has a command
+line equivalent, listed in its own help pane (press `?`).
+
+Build and install it explicitly:
+
+```
+cargo install --path . --force --features tui
+dotgit-tui
+```
+
+It takes no arguments and runs in whichever repository you start it from.
+
+```
+┌ dotgit ────────────────────────────────────────────────────────────────┐
+│ /home/you/dotfiles  [main]                                             │
+│ remote github.com   version 2 of 7 (1 back)   clean   3 backup(s)      │
+└────────────────────────────────────────────────────────────────────────┘
+┌ versions (newest first) ──────────────┐┌ details ──────────────────────┐
+│   3df1c6f tweak colorscheme (newest)  ││ add waybar config             │
+│ > a9a6fdd add waybar config           ││                               │
+│   82c02c8 first upload                ││ commit  a9a6fdd...            │
+│                                       ││ author  you                   │
+│                                       ││ date    20260912-183000 UTC   │
+└───────────────────────────────────────┘└───────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│ restored to version 2 of 3                                             │
+│ r back  f forward  c commit  u upload  p push  b backup  ? keys  q quit│
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+The `>` marker is the point of the left pane: it shows which version your **working
+tree** currently holds, which is not necessarily the newest commit.
+
+| Key     | Action                        | Same as                |
+|---------|-------------------------------|------------------------|
+| `j`/`k` | move through the versions     | —                      |
+| `r`     | step back one version         | `dotgit restore`       |
+| `f`     | step forward one version      | `dotgit rebase`        |
+| `c`     | commit (prompts for a message)| `dotgit commit --no-push` |
+| `u`     | upload a path into the repo   | `dotgit upload <path>` |
+| `p`     | push to the remote            | `dotgit commit`        |
+| `b`     | back up the history locally   | `dotgit backup`        |
+| `?`     | show the keys                 | —                      |
+| `q`     | quit                          | —                      |
+
+Committing in the TUI does not push, so that a commit never blocks on a login prompt;
+press `p` when you want to push. Pushing leaves the full-screen view first, because a
+push may hand over to `gh auth login`, and returns when it is done.
+
+Both front ends call the same functions in `src/ops.rs`, so the TUI cannot drift from
+the CLI: stepping, uploading, committing and backing up behave identically either way,
+including the guard that refuses to step over uncommitted changes.
+
 ## How pushing works
 
 `dotgit` reads the remote from `.git/config` (`git remote get-url origin`) and routes:
@@ -396,6 +523,12 @@ Tokens are read per host: a login for `gitlab.com` is never used against
   dotgit restore     # repeat until the config is the one that worked
   dotgit commit -m "back to the working version"
   ```
+- Undo a commit you regret, keeping the option to change your mind:
+  ```bash
+  dotgit pull            # destroys it, after backing the history up
+  ```
+  Prefer `dotgit revert` when the commit is already shared with other people: it
+  reverses the change without rewriting anyone else's history.
 - Take a local snapshot before anything risky (a force-push, a history rewrite, or
   deleting a repo): `dotgit backup` first, and the old history is still on disk.
 - Keep a `dotfiles` repo and re-upload a config whenever you change it:
@@ -412,11 +545,15 @@ Tokens are read per host: a login for `gitlab.com` is never used against
 ## Development
 
 ```
-cargo build        # debug build
-cargo test         # unit tests
-cargo clippy       # lints
-cargo fmt          # formatting
+cargo build                  # debug build (CLI only)
+cargo build --features tui   # also builds dotgit-tui
+cargo test                   # unit tests
+cargo clippy --all-targets   # lints
+cargo fmt                    # formatting
 ```
+
+`ratatui` is an optional dependency: without `--features tui` it is never compiled, so
+the CLI stays dependency-light for anyone who does not want the TUI.
 
 `DOTGIT_JOBS=<n>` overrides the number of copy threads (default: CPU count, capped
 at 8). Setting `DOTGIT_JOBS=1` forces serial copying, which is occasionally useful
@@ -426,7 +563,11 @@ Source layout:
 
 | File             | Contents                                           |
 |------------------|-----------------------------------------------------|
-| `src/main.rs`    | CLI parsing, path mapping, push orchestration      |
+| `src/main.rs`    | the `dotgit` binary: a shim over `cli::run`        |
+| `src/bin/dg.rs`  | the `dg` alias: the same shim                      |
+| `src/bin/dotgit-tui.rs` | the optional TUI (feature `tui`)            |
+| `src/cli.rs`     | CLI parsing, prompts and output                    |
+| `src/ops.rs`     | operations shared by both front ends               |
 | `src/fsops.rs`   | incremental, multi-threaded file copying           |
 | `src/git.rs`     | git2 operations: staging, commits, remotes, push   |
 | `src/gh.rs`      | gh/glab auth: token discovery from CLI config files |
@@ -447,6 +588,10 @@ Source layout:
 - **`you have uncommitted changes`** on `dotgit restore` / `dotgit rebase` — stepping
   will not overwrite unsaved edits. Keep them with `dotgit commit`, or discard them
   with `git checkout -- .`, then step again.
+- **`you are stepped back through the history`** on `dotgit pull` — run `dotgit rebase`
+  until you reach the newest change, then destroy the commit.
+- **`cannot destroy N commit(s)`** — the history is shorter than `N`, or you asked to
+  destroy the first commit, which `dotgit pull` will not do.
 - **`no commits yet - nothing to step through`** — `dotgit restore` needs at least one
   commit to step through.
 - **`nothing to back up yet - make a commit first`** — a bundle needs at least one

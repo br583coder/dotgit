@@ -186,8 +186,9 @@ fn bundle_name(workdir: &Path, secs: u64) -> String {
 }
 
 /// `YYYYMMDD-HHMMSS` in UTC. Formatting this by hand keeps the dependency
-/// list as it is for the sake of one filename.
-fn format_timestamp(secs: u64) -> String {
+/// list as it is for the sake of one filename. Public because the TUI shows
+/// commit dates with it rather than growing a second implementation.
+pub fn format_timestamp(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let time = secs % 86_400;
     let (year, month, day) = civil_from_days(days);
