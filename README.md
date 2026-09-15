@@ -91,7 +91,7 @@ To update later:
 ```
 cd ~/dotgit
 git pull
-cargo install --path . --force
+cargo install --path . --force --features tui
 ```
 
 ## Authentication
