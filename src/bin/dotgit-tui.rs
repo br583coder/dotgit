@@ -1,4 +1,4 @@
-//! `dotgit-tui`: an optional full-screen browser for a dotfiles repository,
+//! `dotgit status`: an optional full-screen browser for a dotfiles repository,
 //! arranged the way lazygit arranges one.
 //!
 //! The left column holds four panels - status, files, versions and backups -
@@ -8,8 +8,8 @@
 //! ones that apply right now rather than every key that exists.
 //!
 //! Everything here calls the same functions the `dotgit` command calls, so the
-//! two can never disagree. The TUI stays entirely optional: a separate binary
-//! behind a non-default feature, never launched by `dotgit`, and every action
+//! two can never disagree. The TUI stays entirely optional behind a non-default
+//! feature, and every action
 //! names its command line equivalent in the help pane.
 
 use std::path::PathBuf;
@@ -21,22 +21,13 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use dotgit::{backup, git, history, ops};
+use crate::{backup, gh, git, history, ops};
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Err(err) = reject_arguments(&args) {
-        eprintln!("dotgit-tui: {err:#}");
-        std::process::exit(2);
-    }
-
+pub fn run() -> Result<()> {
     let mut terminal = ratatui::init();
     let result = App::new().and_then(|mut app| app.run(&mut terminal));
     ratatui::restore();
-    if let Err(err) = result {
-        eprintln!("dotgit-tui: {err:#}");
-        std::process::exit(1);
-    }
+    result
 }
 
 /// The four side panels, in the order they appear and in the order the number
@@ -783,9 +774,9 @@ impl App {
     fn login(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let host = self.remote.clone();
         let outcome = self.outside(terminal, |_| {
-            let forge = dotgit::gh::forge_for_host(&host).unwrap_or_default();
-            dotgit::gh::ensure_cli(forge)?;
-            dotgit::gh::forge_login(forge, &host)?;
+            let forge = gh::forge_for_host(&host).unwrap_or_default();
+            gh::ensure_cli(forge)?;
+            gh::forge_login(forge, &host)?;
             Ok(format!("logged in to {host}"))
         })?;
         self.report(outcome);
@@ -1164,16 +1155,5 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
         y: area.y + (area.height - height) / 2,
         width,
         height,
-    }
-}
-
-/// Reject arguments rather than silently ignoring them: the TUI takes none, and
-/// anyone passing some is looking for the command line tool.
-fn reject_arguments(args: &[String]) -> Result<()> {
-    match args.first() {
-        None => Ok(()),
-        Some(arg) => Err(anyhow!(
-            "dotgit-tui takes no arguments (got `{arg}`) - run `dotgit {arg}` instead"
-        )),
     }
 }

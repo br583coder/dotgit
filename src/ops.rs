@@ -1,4 +1,4 @@
-//! Operations shared by the `dotgit` CLI and the `dotgit-tui` front end.
+//! Operations shared by the `dotgit` CLI and its optional `status` TUI.
 //!
 //! Nothing in here prints. Each operation returns a description of what it did
 //! so the caller can render it as a line of terminal output or as a pane in a

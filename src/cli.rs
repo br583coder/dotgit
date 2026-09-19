@@ -68,6 +68,8 @@ enum CliCommand {
     Restore,
     /// Step the working tree forward one version, towards the newest change
     Rebase,
+    /// Open the optional full-screen terminal UI
+    Status,
     /// Destroy the newest commit(s) entirely, locally and on the remote
     #[command(alias = "drop")]
     Pull {
@@ -127,6 +129,7 @@ pub fn run() {
         } => new_repo(&name, github, gitlab, public, private, host.as_deref()),
         CliCommand::Restore => step_history(history::Direction::Older),
         CliCommand::Rebase => step_history(history::Direction::Newer),
+        CliCommand::Status => status(),
         CliCommand::Pull {
             count,
             yes,
@@ -143,6 +146,19 @@ pub fn run() {
     if let Err(err) = result {
         eprintln!("dotgit: {err:#}");
         std::process::exit(1);
+    }
+
+    fn status() -> Result<()> {
+        #[cfg(feature = "tui")]
+        {
+            return crate::tui::run();
+        }
+        #[cfg(not(feature = "tui"))]
+        {
+            Err(anyhow!(
+                "`dotgit status` requires the TUI feature; reinstall with `cargo install --path . --force --features tui`"
+            ))
+        }
     }
 }
 

@@ -22,7 +22,7 @@ history in case the remote ever disappears.
 | `dotgit backup`          | save the full history to a local bundle file          |
 | `dotgit login [host]`    | log in through `gh` or `glab`                         |
 
-An optional full-screen browser, [`dotgit-tui`](#dotgit-tui-optional), is available
+An optional full-screen browser, [`dotgit status`](#dotgit-status-optional), is available
 separately. You never need it: it is a different binary, it is not built or installed
 by default, and the `dotgit` command never launches it.
 
@@ -75,7 +75,7 @@ cargo install --path . --force --features tui
 
 That installs `dotgit` and its short alias `dg`. The optional TUI is behind a feature
 flag and is **not** built by this command — see
-[`dotgit-tui`](#dotgit-tui-optional) if you want it.
+[`dotgit status`](#dotgit-status-optional) if you want it.
 
 Verify:
 
@@ -434,7 +434,7 @@ dotgit login git.example.com    # gh (GitHub Enterprise is the fallback)
 A host that names neither forge falls back to `gh`, which is where a GitHub
 Enterprise login lives.
 
-## `dotgit-tui` (optional)
+## `dotgit status` (optional)
 
 A full-screen browser for the repository, laid out the way lazygit lays one out: a
 column of panels on the left, one of them focused, and a main pane on the right that
@@ -449,7 +449,7 @@ Build and install it explicitly:
 
 ```
 cargo install --path . --force --features tui
-dotgit-tui
+dotgit status
 ```
 
 It takes no arguments and runs in whichever repository you start it from.
@@ -565,7 +565,7 @@ Tokens are read per host: a login for `gitlab.com` is never used against
 
 ```
 cargo build                  # debug build (CLI only)
-cargo build --features tui   # also builds dotgit-tui
+cargo build --features tui   # also enables dotgit status
 cargo test                   # unit tests
 cargo clippy --all-targets   # lints
 cargo fmt                    # formatting
@@ -584,7 +584,7 @@ Source layout:
 |------------------|-----------------------------------------------------|
 | `src/main.rs`    | the `dotgit` binary: a shim over `cli::run`        |
 | `src/bin/dg.rs`  | the `dg` alias: the same shim                      |
-| `src/bin/dotgit-tui.rs` | the optional lazygit-style TUI (feature `tui`) |
+| `src/bin/dotgit-tui.rs` | the optional lazygit-style TUI for `dotgit status` (feature `tui`) |
 | `src/cli.rs`     | CLI parsing, prompts and output                    |
 | `src/ops.rs`     | operations shared by both front ends               |
 | `src/fsops.rs`   | incremental, multi-threaded file copying           |
