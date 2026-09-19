@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 
 use crate::error::DotgitError;
 use crate::ops::{self, human_bytes};
-use crate::{backup, gh, git, history};
+use crate::{backup, config, gh, git, history};
 
 #[derive(Parser)]
 #[command(
@@ -115,6 +115,7 @@ enum CliCommand {
 /// way a command line tool should: a message on stderr and a non-zero exit.
 pub fn run() {
     let cli = Cli::parse();
+    let command = command_name(&cli.command);
     let result = match cli.command {
         CliCommand::Upload { paths } => upload(&paths),
         CliCommand::Commit { message, no_push } => commit(message, no_push),
@@ -143,15 +144,43 @@ pub fn run() {
             gitlab,
         } => login(host.as_deref(), github, gitlab),
     };
+    match config::Config::load() {
+        Ok(settings) => {
+            if let Err(log_err) = settings
+                .logging
+                .record(config::Source::Cli, command, &result)
+            {
+                eprintln!("dotgit: logging failed: {log_err:#}");
+            }
+        }
+        Err(config_err) => {
+            eprintln!("dotgit: logging configuration failed: {config_err:#}");
+        }
+    }
     if let Err(err) = result {
         eprintln!("dotgit: {err:#}");
         std::process::exit(1);
     }
 
+    fn command_name(command: &CliCommand) -> &'static str {
+        match command {
+            CliCommand::Upload { .. } => "upload",
+            CliCommand::Commit { .. } => "commit",
+            CliCommand::Revert { .. } => "revert",
+            CliCommand::New { .. } => "new",
+            CliCommand::Restore => "restore",
+            CliCommand::Rebase => "rebase",
+            CliCommand::Status => "status",
+            CliCommand::Pull { .. } => "pull",
+            CliCommand::Backup { .. } => "backup",
+            CliCommand::Login { .. } => "login",
+        }
+    }
+
     fn status() -> Result<()> {
         #[cfg(feature = "tui")]
         {
-            return crate::tui::run();
+            crate::tui::run()
         }
         #[cfg(not(feature = "tui"))]
         {
@@ -224,7 +253,7 @@ fn revert(commit: Option<String>) -> Result<()> {
         Some(_) => return Err(anyhow!("commit revision cannot be empty")),
         None => prompt_revert_commit(&repo)?,
     };
-    let message = git::revert_commit(&repo, &revision)?;
+    let message = ops::revert(&repo, &revision)?;
     let head = repo.head()?;
     let new_commit = head.peel_to_commit()?;
     let id = new_commit.id().to_string();

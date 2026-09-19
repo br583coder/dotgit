@@ -140,6 +140,60 @@ That's it. Every future edit lives at `~/.config/hypr`; upload + commit to sync.
 
 Every command below can be run with either `dotgit` or its shorter alias `dg`.
 
+### Logging with `dotgit.toml`
+
+Dotgit logs what you ran to a local file by default. Configuration is read from these
+files in order, each overriding only the settings it actually contains:
+
+```text
+~/.config/dotgit/dotgit.toml     # your account
+<repository root>/dotgit.toml    # this repository (found from any subdirectory)
+./dotgit.toml                    # the directory you are standing in
+```
+
+Example:
+
+```toml
+[logging]
+enabled = true
+path = "~/.local/state/dotgit/dotgit.log"
+```
+
+Both settings are optional. Logging is on unless a file turns it off, and the default
+path is `$XDG_DATA_HOME/dotgit/dotgit.log` (usually
+`~/.local/share/dotgit/dotgit.log`). A leading `~` in `path` is expanded.
+
+A file only changes what it mentions, so a repository config that sets `path` does not
+switch logging back on if your account config set `enabled = false`. To override a
+setting, write it down explicitly.
+
+Each line is one command, as `key=value` pairs:
+
+```text
+20260918-101500 via=cli command=commit outcome=success repo=/home/you/dotfiles/
+20260918-101733 via=cli command=commit outcome=failure repo=/home/you/dotfiles/ error="no git remote 'origin' configured - add one to push"
+20260918-102140 via=tui command=stage outcome=success repo=/home/you/dotfiles/
+```
+
+`via` says which front end ran it: `cli` for a `dotgit` command, `tui` for an action
+taken inside [`dotgit status`](#dotgit-status-optional). Actions that exist only in the
+TUI log under their own names — `stage`, `unstage`, `stage-all`, `discard`, `jump`,
+`backup-delete` — while the rest reuse the name of the command that does the same
+thing, so `grep command=commit` finds both.
+
+Timestamps are UTC in the same `YYYYMMDD-HHMMSS` form the [backup](#dotgit-backup)
+filenames use, so a log line and a bundle from the same moment line up. Failures keep
+the reason, flattened onto one line.
+
+The log records the timestamp, front end, command name, repository path, and outcome.
+It does **not** record tokens, commit messages, file contents, file paths you upload,
+or command arguments.
+
+If the config file cannot be read or parsed, dotgit says so on stderr and carries on
+with defaults — a broken config never stops a command from running. Misspelled
+settings are rejected rather than ignored, so `[loging]` or a stray `enabled = false`
+outside any section tells you `unknown field` instead of silently doing nothing.
+
 ### `dotgit new <name>`
 
 Creates a repository on GitHub or GitLab and sets it up locally. With no `--github`
@@ -485,18 +539,159 @@ to a panel, `tab` cycles.
 
 | Panel        | Main pane shows                | Keys                                                      |
 |--------------|--------------------------------|-----------------------------------------------------------|
-| `1` status   | a summary of the repository    | `p` push, `b` back up, `L` log in                          |
-| `2` files    | the patch for the selected file| `space` stage/unstage, `a` stage all, `d` discard, `c` commit, `u` upload |
-| `3` versions | the patch the commit introduced| `enter` move here, `r` back one, `f` forward one, `D` destroy, `v` revert |
+| `1` status   | a summary of the repository    | `e` edit `dotgit.toml`, `E` in `$EDITOR`, `p` push, `b` back up, `L` log in |
+| `2` files    | the patch for the selected file| `e` edit, `E` in `$EDITOR`, `space` stage/unstage, `a` stage all, `d` discard, `u` upload |
+| `3` versions | the patch the commit introduced| `enter` move here, `r` back one, `f` forward one, `v` revert, `D` destroy |
 | `4` backups  | the bundle's path and size     | `n` new backup, `d` delete backup                          |
+| `5` commit   | what is staged for the commit  | type the message, `enter` commit and push, `ctrl-l` commit only |
 
 Staged files show green, partly staged yellow, unstaged red. In the versions panel the
 `>` marker is the version your **working tree** holds, which is not necessarily the
-newest commit. `J`/`K` scroll a long patch without leaving the list.
+newest commit.
+
+### Scrolling
+
+Long histories and long patches both scroll, and each pane grows a scrollbar only when
+it holds more than fits:
+
+| Keys                | What scrolls                                              |
+|---------------------|-----------------------------------------------------------|
+| `j` / `k`           | the focused list, one row                                  |
+| `PgDn` / `PgUp`     | the focused list, one pane at a time                       |
+| `g` / `G`           | first / last item in the focused list                      |
+| `J` / `K`           | the diff pane, one line                                    |
+| `ctrl-d` / `ctrl-u` | the diff pane, half a pane                                 |
+| `Home` / `End`      | top / bottom of the diff pane                              |
+| mouse wheel         | whatever is under the pointer                              |
+
+The wheel scrolls the pane you point at, and focuses a side panel if you scroll over
+one. The diff pane's title shows where you are — `lines 35-68 of 242` — and scrolling
+stops when the last line reaches the bottom rather than letting the text slide out of
+view. Every panel keeps its own position, so switching panels and coming back returns
+you to the same place in the history.
 
 `enter` in the versions panel moves the working tree straight to the selected version,
 which the CLI can only reach by stepping (`dotgit restore` repeatedly) — the one thing
 the TUI does more directly than the command line.
+
+### Committing and pushing
+
+The commit message is a **panel, not a pop-up**. Press `c` from anywhere and the cursor
+moves to the message panel along the bottom of the window; type the message in place.
+Nothing overlays the screen, so the staged files and the diff stay visible while you
+write, and the draft survives leaving the panel — `Esc` goes back to the files, and `c`
+brings you back to the message exactly as you left it.
+
+| Key | Action |
+|---|---|
+| any character | write the message |
+| `Enter` | commit what is staged **and push** |
+| `ctrl-l` | commit locally, without pushing |
+| `Esc` | back to the files, keeping the draft |
+
+While the panel has focus the main pane lists **what is actually going into the
+commit**, and the commit takes exactly that: the index, not the working tree. Unstaging
+a file with `space` means it is left out, which is the point of having a staging area.
+Committing with nothing staged says so rather than sweeping up every change, and an
+empty message is refused.
+
+**`Enter` commits and pushes**, the same as `dotgit commit` on the command line. The
+push only happens if the commit succeeded, and a push that fails never hides the commit
+that worked — you get `committed 3df1c6f, but the push failed: …`, with the commit still
+there to push again. A repository with no remote says `committed 3df1c6f; no remote to
+push to` rather than reporting an error.
+
+Use `ctrl-l` when you want the commit without the push: an offline machine, or a repo
+whose remote you have not made yet.
+
+### Editing
+
+`e` opens the selected file in dotgit's own modal editor — no external editor, no
+`$EDITOR` required. It is built on vim's principles, so if you know vim you already
+know it:
+
+```
+  1 alpha                                                    
+  2 new                                                      
+  3 beta                                                     
+ NORMAL  notes.conf [+]                                 2,1  
+```
+
+**Modes.** You start in `NORMAL`, where letters are commands rather than text. `i`
+`a` `I` `A` `o` `O` enter `INSERT`; `Esc` (or `ctrl-c`) returns to `NORMAL`, stepping
+the cursor back onto the last character as vim does. `:` opens the command line.
+
+**The cursor tells you which mode you are in**, the way neovim's does: a solid block
+sitting on the character in `NORMAL`, and a thin blinking bar between characters in
+`INSERT` — the VS Code style caret, so writing mode looks like writing. The status line
+turns green at the same time. Your terminal's own cursor shape is restored when you
+close the editor, when an action hands the screen to another program, and when you quit,
+so nothing is left behind in your shell.
+
+| Keys | What they do |
+|---|---|
+| `h` `j` `k` `l`, arrows | move a character or line |
+| `w` `b` | forward / back a word, across line ends |
+| `0` `^` `$` | start of line, first non-blank, end of line |
+| `gg` `G` `{n}G` `:{n}` | first line, last line, line `n` |
+| `ctrl-d` `ctrl-u` | half a screen down / up |
+| `i` `a` `I` `A` | insert before / after the cursor, at the first non-blank / end of line |
+| `o` `O` | open a line below / above and insert |
+| `x` `D` `dd` `dw` `d$` `cc` | delete a character, to end of line, a line, a word, to end of line, change a line |
+| `yy` `p` `P` | yank a line, paste below / above |
+| `u` `ctrl-r` | undo, redo |
+| `:w` `:q` `:q!` `:wq` `:x` | write, quit, quit discarding, write and quit |
+
+**Syntax highlighting** comes with it, for the kinds of file a dotfiles repo holds:
+TOML, INI/conf, JSON, YAML, shell, Lua, vimscript, Rust, Python and Markdown. The
+language is taken from the extension, or from the name for the extension-less ones
+(`.zshrc`, `.vimrc`, `.gitconfig`, `init.lua`). Comments recede into grey italics,
+strings are green, numbers magenta, keywords blue, `[section]` headers bold yellow, and
+the left-hand side of `key = value` cyan. Highlighting runs per visible line, so a
+large file costs nothing off-screen, and a language it does not know is left plain
+rather than guessed at.
+
+**The mouse works**, as it does in neovim with `mouse=a`: click anywhere in the buffer
+to put the cursor there — clicking past the end of a line lands on its last character —
+and the wheel scrolls the view three lines a notch, carrying the cursor along only when
+it would otherwise leave the window.
+
+**Counts work**, as they must: `3j`, `5x`, `2dd`, `10G`. Operators wait for their
+second key, so `dd`, `dw`, `yy` and `gg` behave as you would expect, and `Esc`
+abandons a half-typed `2d`.
+
+**An entire insert session is one undo step**, not one per keystroke — typing `ihello`
+then `u` removes `hello`, not the `o`. And `:q` refuses to throw away unsaved changes
+with vim's own `E37: No write since last change (add ! to override)`.
+
+Writing the file re-reads the diff and the staging state behind the editor, and the
+final newline is left exactly as the file had it. A file that does not exist yet opens
+as an empty `[New]` buffer, so `e` on the status panel is how you write your first
+`dotgit.toml`.
+
+If you would rather use your own editor, `E` still hands the screen to `$VISUAL` /
+`$EDITOR` (falling back to `vi`) and repaints when it exits.
+
+Both edit the copy **inside the repository**, not the live file in `~`. Copying it
+back out is still a separate step.
+
+### Reverting a commit
+
+`v` in the versions panel adds a commit that undoes the selected one, after showing
+which commit it is and asking. Unlike `D`, nothing is destroyed: the original commit
+stays in the history and the undo sits on top, which is the safe choice for a commit
+other people have already pulled.
+
+A revert is applied to the working tree, so it needs a clean tree on the newest
+version — the same conditions as moving through the history — and says so if either is
+not true. If the commit cannot be undone cleanly, because later commits changed the
+same lines, dotgit reports that and leaves the repository **exactly** as it was: no
+conflict markers in your files, no half-finished revert for other git tools to trip
+over. Resolve that case with `git revert` by hand if you want to work through the
+conflict.
+
+Reverting does not push; press `p` when you want to. `dotgit revert [commit]` does the
+same thing from the command line, and does push.
 
 ### Anything destructive asks first
 

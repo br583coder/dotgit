@@ -67,6 +67,42 @@ pub fn create_commit(repo: &Repository, message: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Commit exactly what is in the index, without staging anything first.
+///
+/// This is what a front end with a staging area needs: unstaging a file has to
+/// mean the file is not committed. [`create_commit`] stages everything first,
+/// which is right for `dotgit commit` on the command line and wrong here.
+pub fn commit_staged(repo: &Repository, message: &str) -> Result<bool> {
+    let mut index = repo.index()?;
+    let tree_id = index.write_tree()?;
+    let tree = repo.find_tree(tree_id)?;
+
+    let parent_commit = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let head_tree = parent_commit.as_ref().and_then(|c| c.tree().ok());
+    let changed = match head_tree {
+        Some(head_tree) => head_tree.id() != tree.id(),
+        None => true,
+    };
+    if !changed {
+        return Ok(false);
+    }
+
+    let signature = repo
+        .signature()
+        .context("set git user.name and user.email to commit")?;
+    let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        message,
+        &tree,
+        &parents,
+    )?;
+    index.write()?;
+    Ok(true)
+}
+
 pub fn recent_commits(repo: &Repository, limit: usize) -> Result<Vec<(Oid, String)>> {
     let mut walk = repo.revwalk()?;
     walk.push_head()?;
@@ -90,8 +126,14 @@ pub fn revert_commit(repo: &Repository, revision: &str) -> Result<String> {
 
     let mut index = repo.index()?;
     if index.has_conflicts() {
+        // Leave nothing half-applied: put the working tree back and clear the
+        // in-progress revert, so the repository is exactly as it was and no
+        // other git tool reports it as mid-revert.
+        let head = repo.head()?.peel_to_commit()?;
+        reset_hard(repo, head.id())?;
+        repo.cleanup_state()?;
         return Err(anyhow!(
-            "reverting {revision} produced conflicts; resolve them and commit manually"
+            "reverting {revision} conflicts with later changes; nothing was changed - revert it with git if you want to resolve the conflict by hand"
         ));
     }
     index.write()?;
@@ -111,6 +153,9 @@ pub fn revert_commit(repo: &Repository, revision: &str) -> Result<String> {
         &tree,
         &[&head],
     )?;
+    // `revert` marks the repository as reverting; without this every later
+    // `git status` claims a revert is still in progress.
+    repo.cleanup_state()?;
     Ok(message)
 }
 

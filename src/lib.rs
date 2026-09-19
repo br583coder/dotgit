@@ -5,10 +5,13 @@
 
 pub mod backup;
 pub mod cli;
+pub mod config;
+pub mod editor;
 pub mod error;
 pub mod fsops;
 pub mod gh;
 pub mod git;
+pub mod highlight;
 pub mod history;
 pub mod ops;
 #[cfg(feature = "tui")]

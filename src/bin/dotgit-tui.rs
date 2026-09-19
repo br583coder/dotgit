@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use git2::Repository;
 use ratatui::DefaultTerminal;
+use ratatui::crossterm::cursor::SetCursorStyle;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseEventKind,
@@ -32,6 +33,8 @@ use ratatui::widgets::{
 };
 
 use crate::config::{self, Source};
+use crate::editor::{self, Editor};
+use crate::highlight::{self, Kind};
 use crate::{backup, gh, git, history, ops};
 
 pub fn run() -> Result<()> {
@@ -45,6 +48,8 @@ pub fn run() -> Result<()> {
     if mouse.is_ok() {
         let _ = capture_mouse(false);
     }
+    // Never leave the user's shell with a cursor shape dotgit chose.
+    let _ = Shape::Default.apply();
     ratatui::restore();
     result
 }
@@ -68,10 +73,20 @@ enum Panel {
     Files,
     Versions,
     Backups,
+    /// The commit message, typed in place. There is no pop-up: the message is
+    /// part of the layout, so it survives looking at a diff and can be written
+    /// over several visits.
+    Commit,
 }
 
 impl Panel {
-    const ALL: [Panel; 4] = [Panel::Status, Panel::Files, Panel::Versions, Panel::Backups];
+    const ALL: [Panel; 5] = [
+        Panel::Status,
+        Panel::Files,
+        Panel::Versions,
+        Panel::Backups,
+        Panel::Commit,
+    ];
 
     fn title(self) -> &'static str {
         match self {
@@ -79,6 +94,7 @@ impl Panel {
             Panel::Files => " 2 files ",
             Panel::Versions => " 3 versions ",
             Panel::Backups => " 4 backups ",
+            Panel::Commit => " 5 commit message ",
         }
     }
 
@@ -98,13 +114,15 @@ impl Panel {
     fn keys(self) -> &'static [(&'static str, &'static str, &'static str)] {
         match self {
             Panel::Status => &[
-                ("e", "edit dotgit.toml", ""),
+                ("e", "edit dotgit.toml here", ""),
+                ("E", "edit it in $EDITOR", ""),
                 ("p", "push", "dotgit commit"),
                 ("b", "back up history", "dotgit backup"),
                 ("L", "log in to the remote", "dotgit login"),
             ],
             Panel::Files => &[
-                ("e", "edit in $EDITOR", ""),
+                ("e", "edit here (vim keys)", ""),
+                ("E", "edit in $EDITOR", ""),
                 ("space", "stage / unstage", "dotgit upload stages for you"),
                 ("a", "stage everything", ""),
                 ("d", "discard changes", ""),
@@ -122,6 +140,45 @@ impl Panel {
                 ("n", "new backup", "dotgit backup"),
                 ("d", "delete backup", ""),
             ],
+            Panel::Commit => &[
+                ("type", "write the message", ""),
+                ("enter", "commit and push", "dotgit commit"),
+                ("ctrl-l", "commit locally only", "dotgit commit --no-push"),
+                ("esc", "back to the files", ""),
+            ],
+        }
+    }
+}
+
+/// The cursor shapes the interface asks the terminal for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// Whatever the user's terminal normally uses.
+    Default,
+    /// A block sitting on the character, as in vim's normal mode.
+    Block,
+    /// A thin blinking bar between characters, as in VS Code - and what neovim
+    /// switches to for insert mode.
+    Bar,
+}
+
+impl Shape {
+    /// Writing mode gets the bar; everything else gets a block.
+    fn for_editor(mode: editor::Mode) -> Self {
+        match mode {
+            editor::Mode::Insert => Shape::Bar,
+            // The command line is typed into, but the cursor on screen is still
+            // the buffer's, so it keeps the block.
+            editor::Mode::Normal | editor::Mode::Command => Shape::Block,
+        }
+    }
+
+    fn apply(self) -> std::io::Result<()> {
+        let mut out = std::io::stdout();
+        match self {
+            Shape::Default => execute!(out, SetCursorStyle::DefaultUserShape),
+            Shape::Block => execute!(out, SetCursorStyle::SteadyBlock),
+            Shape::Bar => execute!(out, SetCursorStyle::BlinkingBar),
         }
     }
 }
@@ -145,34 +202,40 @@ struct BackupRow {
 /// anything.
 enum Pending {
     DestroyCommit,
+    RevertCommit(String),
     DiscardFile(String, bool),
     DeleteBackup(PathBuf),
 }
 
 enum Mode {
     Browse,
-    Input { kind: Input, buffer: String },
-    Confirm { question: String, action: Pending },
+    /// The built-in modal editor has the screen.
+    Edit(Box<Editor>),
+    Input {
+        kind: Input,
+        buffer: String,
+    },
+    Confirm {
+        question: String,
+        action: Pending,
+    },
     Help,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Input {
-    CommitMessage,
     UploadPath,
 }
 
 impl Input {
     fn title(self) -> &'static str {
         match self {
-            Input::CommitMessage => " commit message ",
             Input::UploadPath => " path to upload ",
         }
     }
 
     fn hint(self) -> &'static str {
         match self {
-            Input::CommitMessage => "Enter commits (locally; press p to push)   Esc cancels",
             Input::UploadPath => "e.g. ~/.config/hypr    Enter uploads   Esc cancels",
         }
     }
@@ -188,7 +251,9 @@ struct App {
     commits: Vec<CommitRow>,
     backups: Vec<BackupRow>,
     /// Selection per panel, indexed the way [`Panel::ALL`] is ordered.
-    selected: [usize; 4],
+    selected: [usize; 5],
+    /// The commit message being written in panel 5.
+    message_draft: String,
     position: usize,
     dirty: bool,
     /// The right-hand pane: a title and the lines beneath it.
@@ -199,10 +264,16 @@ struct App {
     /// to stop at the point where the final line reaches the bottom, instead of
     /// letting the content slide out of view entirely.
     main_height: usize,
+    /// Where the editor's text was last drawn, so a click can be turned into a
+    /// line and column.
+    edit_area: Rect,
+    /// The cursor shape currently set, so the escape sequence is only sent when
+    /// it actually changes rather than on every frame.
+    cursor_shape: Shape,
     /// Where each panel was drawn, so a mouse event can be sent to whatever is
     /// under the pointer rather than to whatever has focus.
     main_area: Rect,
-    list_areas: [Rect; 4],
+    list_areas: [Rect; 5],
     message: String,
     mode: Mode,
     /// Read once at start-up, so every action taken here lands in dotgit.log
@@ -224,15 +295,18 @@ impl App {
             files: Vec::new(),
             commits: Vec::new(),
             backups: Vec::new(),
-            selected: [0; 4],
+            selected: [0; 5],
+            message_draft: String::new(),
             position: 0,
             dirty: false,
             main_title: String::new(),
             main_lines: Vec::new(),
             scroll: 0,
             main_height: 0,
+            edit_area: Rect::ZERO,
+            cursor_shape: Shape::Default,
             main_area: Rect::ZERO,
-            list_areas: [Rect::ZERO; 4],
+            list_areas: [Rect::ZERO; 5],
             message: "? for keys, tab to change panel, q to quit".into(),
             mode: Mode::Browse,
             // A broken config must not stop the interface from opening, so fall
@@ -265,6 +339,7 @@ impl App {
             Panel::Files => self.files.len(),
             Panel::Versions => self.commits.len(),
             Panel::Backups => self.backups.len(),
+            Panel::Commit => 0,
         }
     }
 
@@ -321,7 +396,7 @@ impl App {
         // Keep every panel's selection inside its (possibly shrunken) list.
         for (slot, panel) in Panel::ALL.iter().enumerate() {
             let rows = match panel {
-                Panel::Status => 0,
+                Panel::Status | Panel::Commit => 0,
                 Panel::Files => self.files.len(),
                 Panel::Versions => self.commits.len(),
                 Panel::Backups => self.backups.len(),
@@ -354,6 +429,29 @@ impl App {
             Panel::Status => {
                 self.main_title = " repository ".into();
                 self.main_lines = self.status_summary();
+            }
+            // Writing a message is about what is going into the commit, so show
+            // that rather than leaving the pane on whatever was there before.
+            Panel::Commit => {
+                self.main_title = " to be committed ".into();
+                let staged: Vec<String> = self
+                    .files
+                    .iter()
+                    .filter(|f| f.staged)
+                    .map(|f| format!("{}  {}", f.label, f.path))
+                    .collect();
+                self.main_lines = if staged.is_empty() {
+                    vec![
+                        "nothing is staged".into(),
+                        String::new(),
+                        "stage files in panel 2 with space, or a to stage everything".into(),
+                    ]
+                } else {
+                    let mut lines =
+                        vec![format!("{} file(s) staged:", staged.len()), String::new()];
+                    lines.extend(staged);
+                    lines
+                };
             }
             Panel::Files => match self.files.get(index) {
                 None => {
@@ -450,6 +548,7 @@ impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             terminal.draw(|frame| self.draw(frame))?;
+            self.shape_cursor();
             let key = match event::read()? {
                 Event::Key(key) => key,
                 Event::Mouse(mouse) => {
@@ -463,7 +562,9 @@ impl App {
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
-                    KeyCode::Char('c') => {
+                    // In the editor this is vim's "return to normal mode", so
+                    // it must not tear the whole interface down.
+                    KeyCode::Char('c') if !matches!(self.mode, Mode::Edit(_)) => {
                         self.quit = true;
                         continue;
                     }
@@ -472,14 +573,30 @@ impl App {
                         self.scroll_main(self.half_pane());
                         continue;
                     }
-                    KeyCode::Char('u') => {
+                    KeyCode::Char('u') if !matches!(self.mode, Mode::Edit(_)) => {
                         self.scroll_main(-self.half_pane());
+                        continue;
+                    }
+                    // Commit and push from the message panel; `ctrl-l` keeps the
+                    // commit local, for an offline machine or a repo with no
+                    // remote yet.
+                    KeyCode::Char('p')
+                        if self.focus == Panel::Commit && matches!(self.mode, Mode::Browse) =>
+                    {
+                        self.commit_draft(true, terminal)?;
+                        continue;
+                    }
+                    KeyCode::Char('l')
+                        if self.focus == Panel::Commit && matches!(self.mode, Mode::Browse) =>
+                    {
+                        self.commit_draft(false, terminal)?;
                         continue;
                     }
                     _ => {}
                 }
             }
             match &self.mode {
+                Mode::Edit(_) => self.edit_key(key)?,
                 Mode::Help => self.mode = Mode::Browse,
                 Mode::Confirm { .. } => self.confirm_key(key.code)?,
                 Mode::Input { kind, buffer } => {
@@ -492,7 +609,27 @@ impl App {
         Ok(())
     }
 
+    /// Ask the terminal for the cursor shape this mode wants, when it differs
+    /// from the one already set.
+    fn shape_cursor(&mut self) {
+        let wanted = match &self.mode {
+            Mode::Edit(editor) => Shape::for_editor(editor.mode),
+            // Outside the editor no cursor is shown, so leave the terminal's own
+            // shape alone for whatever comes next.
+            _ => Shape::Default,
+        };
+        if wanted != self.cursor_shape {
+            // A terminal that ignores the request is not worth reporting: the
+            // interface works the same either way.
+            let _ = wanted.apply();
+            self.cursor_shape = wanted;
+        }
+    }
+
     fn browse_key(&mut self, code: KeyCode, terminal: &mut DefaultTerminal) -> Result<()> {
+        if self.focus == Panel::Commit {
+            return self.commit_panel_key(code, terminal);
+        }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('?') => self.mode = Mode::Help,
@@ -526,19 +663,88 @@ impl App {
         Ok(())
     }
 
+    /// The commit panel takes text, so only a few keys are commands here.
+    fn commit_panel_key(&mut self, code: KeyCode, terminal: &mut DefaultTerminal) -> Result<()> {
+        match code {
+            // Leaving keeps the draft: a message half-written is not lost by
+            // looking at a diff.
+            KeyCode::Esc => self.focus(Panel::Files),
+            KeyCode::Tab => self.focus(self.focus.next()),
+            KeyCode::BackTab => self.focus(self.focus.previous()),
+            // The same thing `dotgit commit` does: commit, then push.
+            KeyCode::Enter => self.commit_draft(true, terminal)?,
+            KeyCode::Backspace => {
+                self.message_draft.pop();
+            }
+            KeyCode::Char(c) => self.message_draft.push(c),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Commit what is staged with the message in the panel, and optionally push.
+    fn commit_draft(&mut self, push_after: bool, terminal: &mut DefaultTerminal) -> Result<()> {
+        let message = self.message_draft.trim().to_string();
+        if message.is_empty() {
+            self.message = "write a commit message first".into();
+            return Ok(());
+        }
+
+        let outcome = self.commit_message(&message);
+        let committed = outcome.as_ref().ok().cloned();
+        self.report("commit", outcome);
+        let Some(committed) = committed else {
+            return Ok(());
+        };
+        self.message_draft.clear();
+        self.refresh()?;
+
+        if !push_after {
+            self.message = format!("{committed} (not pushed)");
+            return Ok(());
+        }
+        if git::remote_url(&self.repo).is_err() {
+            self.message = format!("{committed}; no remote to push to");
+            return Ok(());
+        }
+
+        // A push that fails must not hide the commit that succeeded.
+        let pushed = self.push_report(terminal)?;
+        self.message = match pushed {
+            Ok(where_to) => format!("{committed} and pushed to {where_to}"),
+            Err(err) => format!("{committed}, but the push failed: {err:#}"),
+        };
+        self.refresh()
+    }
+
+    /// Commit exactly what is staged, so unstaging a file means it is left out.
+    fn commit_message(&mut self, message: &str) -> Result<String> {
+        if !git::commit_staged(&self.repo, message)? {
+            return Err(anyhow!("nothing staged - stage files in panel 2 first"));
+        }
+        history::clear(&self.repo)?;
+        let head = self.repo.head()?.peel_to_commit()?;
+        let (id, _) = git::describe(&self.repo, head.id())?;
+        Ok(format!("committed {id}"))
+    }
+
     /// Keys that mean different things depending on which panel has focus.
     fn panel_key(&mut self, code: KeyCode, terminal: &mut DefaultTerminal) -> Result<()> {
         match (self.focus, code) {
             (_, KeyCode::Char('p')) => self.push(terminal)?,
             (_, KeyCode::Char('b')) | (Panel::Backups, KeyCode::Char('n')) => self.backup()?,
             (Panel::Status, KeyCode::Char('L')) => self.login(terminal)?,
-            (Panel::Status, KeyCode::Char('e')) => self.edit_config(terminal)?,
+            (Panel::Status, KeyCode::Char('e')) => self.open_editor(self.root.join("dotgit.toml")),
+            (Panel::Status, KeyCode::Char('E')) => self.edit_config(terminal)?,
 
-            (Panel::Files, KeyCode::Char('e')) => self.edit_file(terminal)?,
+            (Panel::Files, KeyCode::Char('e')) => self.edit_selected(),
+            (Panel::Files, KeyCode::Char('E')) => self.edit_file(terminal)?,
 
             (Panel::Files, KeyCode::Char(' ')) => self.toggle_stage()?,
             (Panel::Files, KeyCode::Char('a')) => self.stage_all()?,
-            (Panel::Files, KeyCode::Char('c')) => self.ask(Input::CommitMessage),
+            // No dialog: `c` moves to the message panel, where the message is
+            // typed in place.
+            (_, KeyCode::Char('c')) => self.focus(Panel::Commit),
             (Panel::Files, KeyCode::Char('u')) => self.ask(Input::UploadPath),
             (Panel::Files, KeyCode::Char('d')) => self.ask_discard(),
 
@@ -546,7 +752,7 @@ impl App {
             (Panel::Versions, KeyCode::Char('r')) => self.step(history::Direction::Older)?,
             (Panel::Versions, KeyCode::Char('f')) => self.step(history::Direction::Newer)?,
             (Panel::Versions, KeyCode::Char('D')) => self.ask_destroy()?,
-            (Panel::Versions, KeyCode::Char('v')) => self.revert()?,
+            (Panel::Versions, KeyCode::Char('v')) => self.ask_revert(),
 
             (Panel::Backups, KeyCode::Char('d')) => self.ask_delete_backup(),
             _ => {}
@@ -598,6 +804,11 @@ impl App {
     /// Send a wheel event to whatever the pointer is over, falling back to the
     /// diff pane, which is what people usually mean to scroll.
     fn mouse(&mut self, mouse: ratatui::crossterm::event::MouseEvent) {
+        // The editor owns the screen while it is open, so it owns the mouse too.
+        if matches!(self.mode, Mode::Edit(_)) {
+            self.edit_mouse(mouse);
+            return;
+        }
         let delta = match mouse.kind {
             MouseEventKind::ScrollDown => 1,
             MouseEventKind::ScrollUp => -1,
@@ -654,11 +865,10 @@ impl App {
                     self.message = "nothing entered".into();
                     return Ok(());
                 }
-                let (command, outcome) = match kind {
-                    Input::CommitMessage => ("commit", self.commit(&value)),
-                    Input::UploadPath => ("upload", self.upload(&value)),
+                let outcome = match kind {
+                    Input::UploadPath => self.upload(&value),
                 };
-                self.report(command, outcome);
+                self.report("upload", outcome);
                 self.refresh()?;
             }
             KeyCode::Backspace => {
@@ -686,6 +896,7 @@ impl App {
         };
         let (command, outcome) = match action {
             Pending::DestroyCommit => ("pull", self.destroy_commit()),
+            Pending::RevertCommit(revision) => ("revert", self.revert(&revision)),
             Pending::DiscardFile(path, untracked) => ("discard", self.discard(&path, untracked)),
             Pending::DeleteBackup(path) => ("backup-delete", self.delete_backup(&path)),
         };
@@ -749,18 +960,6 @@ impl App {
         } else {
             format!("discarded changes to {path}")
         })
-    }
-
-    fn commit(&mut self, message: &str) -> Result<String> {
-        if !git::create_commit(&self.repo, message)? {
-            return Ok("nothing to commit, working tree clean".into());
-        }
-        // The commit just made is the newest version, so a stepped-back cursor
-        // no longer applies - the rule the CLI follows too.
-        history::clear(&self.repo)?;
-        let head = self.repo.head()?.peel_to_commit()?;
-        let (id, _) = git::describe(&self.repo, head.id())?;
-        Ok(format!("committed {id} (press p to push)"))
     }
 
     fn upload(&mut self, path: &str) -> Result<String> {
@@ -851,15 +1050,22 @@ impl App {
         Ok(message)
     }
 
-    fn revert(&mut self) -> Result<()> {
+    fn ask_revert(&mut self) {
         let Some(commit) = self.commits.get(self.selection()) else {
-            return Ok(());
+            return;
         };
-        let revision = commit.oid.to_string();
-        let outcome = git::revert_commit(&self.repo, &revision)
-            .map(|_| format!("reverted {} in a new commit", commit.id));
-        self.report("revert", outcome);
-        self.refresh()
+        self.mode = Mode::Confirm {
+            question: format!(
+                "add a commit that undoes {} \"{}\"?",
+                commit.id, commit.subject
+            ),
+            action: Pending::RevertCommit(commit.oid.to_string()),
+        };
+    }
+
+    fn revert(&mut self, revision: &str) -> Result<String> {
+        let message = ops::revert(&self.repo, revision)?;
+        Ok(format!("{message} (press p to push)"))
     }
 
     fn backup(&mut self) -> Result<()> {
@@ -890,6 +1096,81 @@ impl App {
             "deleted {}",
             path.file_name().unwrap_or_default().to_string_lossy()
         ))
+    }
+
+    /// Clicks and wheel notches inside the editor, as neovim handles them with
+    /// `mouse=a`: a click moves the cursor, the wheel scrolls the view.
+    fn edit_mouse(&mut self, mouse: ratatui::crossterm::event::MouseEvent) {
+        let area = self.edit_area;
+        let Mode::Edit(editor) = &mut self.mode else {
+            return;
+        };
+        match mouse.kind {
+            MouseEventKind::ScrollDown => editor.scroll_view(3, area.height as usize),
+            MouseEventKind::ScrollUp => editor.scroll_view(-3, area.height as usize),
+            MouseEventKind::Down(_) => {
+                // Ignore clicks outside the text, such as on the status line.
+                if !area.contains(Position::new(mouse.column, mouse.row)) {
+                    return;
+                }
+                let line = editor.scroll + (mouse.row - area.y) as usize;
+                let column = (mouse.column - area.x) as usize;
+                editor.click(line, column);
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the built-in editor on the selected file.
+    fn edit_selected(&mut self) {
+        let Some(file) = self.files.get(self.selection()) else {
+            self.message = "no file selected".into();
+            return;
+        };
+        let path = self.root.join(&file.path);
+        if !path.exists() {
+            self.message = format!("{} no longer exists on disk", file.path);
+            return;
+        }
+        self.open_editor(path);
+    }
+
+    fn open_editor(&mut self, path: PathBuf) {
+        match Editor::open(&path) {
+            Ok(editor) => {
+                self.message = format!("editing {} - :w writes, :q closes", editor.name());
+                self.mode = Mode::Edit(Box::new(editor));
+            }
+            Err(err) => self.message = format!("error: {err:#}"),
+        }
+    }
+
+    /// Hand a key to the open editor, then act on what it reports.
+    fn edit_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> Result<()> {
+        let Mode::Edit(editor) = &mut self.mode else {
+            return Ok(());
+        };
+        let Some(translated) = translate(key) else {
+            return Ok(());
+        };
+        let outcome = editor.key(translated);
+        let (name, path) = (editor.name(), editor.path.clone());
+
+        if outcome.saved {
+            // The file on disk changed, so the diff and the staging state shown
+            // behind the editor are now stale.
+            let logged: Result<String> = Ok(format!("wrote {name}"));
+            self.report("edit", logged);
+            let _ = path;
+        }
+        if outcome.closed {
+            self.mode = Mode::Browse;
+            self.message = format!("closed {name}");
+        }
+        if outcome.saved {
+            self.refresh()?;
+        }
+        Ok(())
     }
 
     /// Open the selected file in the user's editor. A real editor beats
@@ -935,6 +1216,26 @@ impl App {
         self.refresh()
     }
 
+    /// Push and hand the result back, for callers that want to say what
+    /// happened to the commit as well as the push.
+    fn push_report(&mut self, terminal: &mut DefaultTerminal) -> Result<Result<String>> {
+        let outcome = self.outside(terminal, |app| {
+            ops::push(&app.repo, false).map(|report| match report {
+                ops::PushReport::Ssh { host } => host,
+                ops::PushReport::Http { host, username } => format!("{host} as {username}"),
+                ops::PushReport::Local { target } => target,
+            })
+        })?;
+        if let Err(err) = &outcome {
+            let failed: Result<String> = Err(anyhow!("{err:#}"));
+            self.report("push", failed);
+        } else {
+            let ok: Result<String> = Ok(String::new());
+            self.report("push", ok);
+        }
+        Ok(outcome)
+    }
+
     /// Push, giving the terminal back first: a push may hand over to
     /// `gh auth login`, which needs the ordinary screen to talk to the user.
     fn push(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -978,6 +1279,9 @@ impl App {
         // Mouse reporting has to go off with the full-screen view, or `gh auth
         // login` would receive the wheel as gibberish on its prompt.
         let _ = capture_mouse(false);
+        // An external program should not inherit the editor's bar cursor.
+        let _ = Shape::Default.apply();
+        self.cursor_shape = Shape::Default;
         disable_raw_mode()?;
         execute!(std::io::stdout(), LeaveAlternateScreen)?;
 
@@ -999,8 +1303,24 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let rows =
-            Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(frame.area());
+        // The editor is not a panel: while it is open it is the whole screen,
+        // the way opening a file in vim replaces what you were looking at.
+        if let Mode::Edit(editor) = &mut self.mode {
+            let area = frame.area();
+            // One row goes to the status line beneath the buffer.
+            let text_height = area.height.saturating_sub(1) as usize;
+            editor.follow(text_height);
+            self.edit_area = draw_editor(frame, area, editor);
+            return;
+        }
+
+        let rows = Layout::vertical([
+            Constraint::Min(6),
+            // The commit message: one line of text between its borders.
+            Constraint::Length(3),
+            Constraint::Length(4),
+        ])
+        .split(frame.area());
         let columns = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(rows[0]);
         let side = Layout::vertical([
@@ -1015,7 +1335,7 @@ impl App {
         // needs to know what sits where.
         self.main_area = columns[1];
         self.main_height = columns[1].height.saturating_sub(2) as usize;
-        self.list_areas = [side[0], side[1], side[2], side[3]];
+        self.list_areas = [side[0], side[1], side[2], side[3], rows[1]];
         // A pane that has shrunk may leave the view scrolled past the end.
         self.scroll = self.scroll.min(self.max_scroll());
 
@@ -1024,9 +1344,11 @@ impl App {
         self.draw_versions(frame, side[2]);
         self.draw_backups(frame, side[3]);
         self.draw_main(frame, columns[1]);
-        self.draw_footer(frame, rows[1]);
+        self.draw_commit(frame, rows[1]);
+        self.draw_footer(frame, rows[2]);
 
         match &self.mode {
+            Mode::Edit(_) => {}
             Mode::Input { kind, buffer } => self.draw_input(frame, *kind, buffer),
             Mode::Confirm { question, .. } => self.draw_confirm(frame, question),
             Mode::Help => self.draw_help(frame),
@@ -1270,6 +1592,25 @@ impl App {
         }
     }
 
+    /// The commit message panel: the text being written, or a hint when empty.
+    fn draw_commit(&self, frame: &mut Frame, area: Rect) {
+        let focused = self.focus == Panel::Commit;
+        let line = if self.message_draft.is_empty() && !focused {
+            Line::from(Span::styled(
+                "press c to write a commit message",
+                Style::new().fg(Color::DarkGray),
+            ))
+        } else {
+            let mut spans = vec![Span::raw(self.message_draft.clone())];
+            if focused {
+                // A visible caret, since the terminal cursor is not used here.
+                spans.push(Span::styled("_", Style::new().fg(Color::Cyan).bold()));
+            }
+            Line::from(spans)
+        };
+        frame.render_widget(Paragraph::new(line).block(self.block(Panel::Commit)), area);
+    }
+
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         // Only the focused panel's keys, plus the handful that always work.
         let mut keys: Vec<Span> = Vec::new();
@@ -1400,6 +1741,38 @@ impl App {
     }
 }
 
+/// Turn a terminal key event into one of the editor's keys. Anything it has no
+/// meaning for is dropped rather than guessed at.
+fn translate(key: ratatui::crossterm::event::KeyEvent) -> Option<editor::Key> {
+    use editor::Key;
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('r') => Some(Key::Redo),
+            KeyCode::Char('d') => Some(Key::HalfPageDown),
+            KeyCode::Char('u') => Some(Key::HalfPageUp),
+            // vim treats ctrl-c as "back to normal mode".
+            KeyCode::Char('c') => Some(Key::Esc),
+            _ => None,
+        };
+    }
+    match key.code {
+        KeyCode::Char(c) => Some(Key::Char(c)),
+        KeyCode::Esc => Some(Key::Esc),
+        KeyCode::Enter => Some(Key::Enter),
+        KeyCode::Backspace => Some(Key::Backspace),
+        KeyCode::Tab => Some(Key::Tab),
+        KeyCode::Left => Some(Key::Left),
+        KeyCode::Right => Some(Key::Right),
+        KeyCode::Up => Some(Key::Up),
+        KeyCode::Down => Some(Key::Down),
+        KeyCode::Home => Some(Key::Home),
+        KeyCode::End => Some(Key::End),
+        KeyCode::PageDown => Some(Key::HalfPageDown),
+        KeyCode::PageUp => Some(Key::HalfPageUp),
+        _ => None,
+    }
+}
+
 /// Run the user's editor on `path` and wait for it to close.
 ///
 /// The command is passed to a shell with the path as an argument rather than
@@ -1467,6 +1840,101 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
         y: area.y + (area.height - height) / 2,
         width,
         height,
+    }
+}
+
+/// Draw the buffer, a gutter of line numbers, and vim's status line. Returns
+/// the rectangle the text itself occupies, which is what turns a click into a
+/// line and column.
+fn draw_editor(frame: &mut Frame, area: Rect, editor: &Editor) -> Rect {
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    let gutter_width = format!("{}", editor.lines.len()).len().max(3) as u16 + 1;
+    let columns =
+        Layout::horizontal([Constraint::Length(gutter_width), Constraint::Min(1)]).split(rows[0]);
+
+    let height = rows[0].height as usize;
+    let visible = editor
+        .lines
+        .iter()
+        .enumerate()
+        .skip(editor.scroll)
+        .take(height);
+
+    let language = highlight::language_for(&editor.path);
+    let mut numbers: Vec<Line> = Vec::new();
+    let mut text: Vec<Line> = Vec::new();
+    for (index, line) in visible {
+        let current = index == editor.line;
+        numbers.push(Line::from(Span::styled(
+            format!("{:>width$} ", index + 1, width = gutter_width as usize - 1),
+            if current {
+                Style::new().fg(Color::Yellow)
+            } else {
+                Style::new().fg(Color::DarkGray)
+            },
+        )));
+        // Highlight per visible line: nothing off-screen is ever tokenised.
+        text.push(Line::from(
+            highlight::highlight(language, line)
+                .into_iter()
+                .map(|span| Span::styled(span.text, style_for(span.kind)))
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(numbers), columns[0]);
+    frame.render_widget(Paragraph::new(text), columns[1]);
+
+    // The status line: mode on the left, position on the right, as in vim.
+    let mode = editor.mode.label();
+    let modified = if editor.modified { " [+]" } else { "" };
+    let left = format!(" {mode}  {}{modified}  {}", editor.name(), editor.status());
+    let right = format!("{},{} ", editor.line + 1, editor.column + 1);
+    let padding =
+        (rows[1].width as usize).saturating_sub(left.chars().count() + right.chars().count());
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                left,
+                match editor.mode {
+                    editor::Mode::Insert => Style::new().fg(Color::Black).bg(Color::Green),
+                    editor::Mode::Command => Style::new().fg(Color::Black).bg(Color::Cyan),
+                    editor::Mode::Normal => Style::new().fg(Color::Black).bg(Color::Gray),
+                },
+            ),
+            Span::raw(" ".repeat(padding)),
+            Span::styled(right, Style::new().fg(Color::DarkGray)),
+        ])),
+        rows[1],
+    );
+
+    // Put the terminal's own cursor where the editor's is, so it blinks in the
+    // right place and follows the mode's shape.
+    let row = (editor.line - editor.scroll) as u16;
+    let column = editor.column as u16;
+    if row < columns[1].height {
+        frame.set_cursor_position(Position::new(
+            columns[1].x + column.min(columns[1].width.saturating_sub(1)),
+            columns[1].y + row,
+        ));
+    }
+    columns[1]
+}
+
+/// Colours for the highlighter's token kinds, following the conventions a
+/// neovim user expects: comments recede, strings and numbers stand out, and
+/// keywords carry the structure.
+fn style_for(kind: Kind) -> Style {
+    match kind {
+        Kind::Comment => Style::new().fg(Color::DarkGray).italic(),
+        Kind::Str => Style::new().fg(Color::Green),
+        Kind::Number => Style::new().fg(Color::Magenta),
+        Kind::Keyword => Style::new().fg(Color::Blue).bold(),
+        Kind::Constant => Style::new().fg(Color::Yellow),
+        Kind::Key => Style::new().fg(Color::Cyan),
+        Kind::Section => Style::new().fg(Color::Yellow).bold(),
+        Kind::Punctuation => Style::new().fg(Color::Gray),
+        Kind::Plain => Style::new(),
     }
 }
 

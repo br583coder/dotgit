@@ -1,6 +1,6 @@
 [package]
 name = "dotgit"
-version = "1.2.1"
+version = "1.2.12"
 edition = "2024"
 autobins = false
 
@@ -23,6 +23,8 @@ dirs = "5"
 git2 = "0.19"
 ratatui = { version = "0.30.2", optional = true }
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 [profile.release]
 opt-level = 3
 lto = true

@@ -164,6 +164,28 @@ pub fn step(repo: &Repository, direction: history::Direction) -> Result<StepRepo
     Ok(StepReport::Moved(next))
 }
 
+/// Reverse a commit by adding a commit that undoes it.
+///
+/// The guards match the ones on moving through the history: a revert applies to
+/// the working tree, so it only makes sense from a clean tree that is on the
+/// newest version.
+pub fn revert(repo: &Repository, revision: &str) -> Result<String> {
+    let position = history::current(repo)?;
+    if !position.is_newest() {
+        return Err(DotgitError::from(
+            "you are stepped back through the history - run `dotgit rebase` until you reach the newest change first",
+        )
+        .into());
+    }
+    if git::has_changes_against(repo, position.oid)? {
+        return Err(DotgitError::from(
+            "you have uncommitted changes - commit or discard them before reverting a commit",
+        )
+        .into());
+    }
+    git::revert_commit(repo, revision)
+}
+
 /// Move the working tree to the version at `index` in the history, where 0 is
 /// the newest. Stepping is the one-at-a-time case of this; a front end showing
 /// the whole list can jump straight to the version the user picked.
@@ -358,6 +380,151 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway repository with a configured identity, for the tests that
+    /// need real commits rather than arithmetic.
+    fn scratch(label: &str) -> (PathBuf, Repository) {
+        let dir = std::env::temp_dir().join(format!("dotgit-ops-{label}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "test").unwrap();
+        config.set_str("user.email", "test@example.com").unwrap();
+        (dir, repo)
+    }
+
+    /// Write `contents` to `name` and commit it.
+    fn commit(repo: &Repository, dir: &Path, name: &str, contents: &str, message: &str) {
+        std::fs::write(dir.join(name), contents).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(name)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = repo.signature().unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn committing_from_a_staging_area_honours_what_is_staged() {
+        let (dir, repo) = scratch("commit-staged");
+        commit(&repo, &dir, "kept", "one\n", "first");
+
+        // Two changes, only one of them staged.
+        std::fs::write(dir.join("kept"), "two\n").unwrap();
+        std::fs::write(dir.join("unstaged"), "new\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("kept")).unwrap();
+        index.write().unwrap();
+
+        assert!(git::commit_staged(&repo, "only the staged change").unwrap());
+
+        // The commit holds the staged file at its new contents and does not
+        // hold the unstaged one at all.
+        let tree = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(tree.get_name("kept").is_some());
+        assert!(
+            tree.get_name("unstaged").is_none(),
+            "an unstaged file must not be committed"
+        );
+        // And the unstaged change is still waiting in the working tree.
+        assert!(dir.join("unstaged").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn committing_nothing_staged_reports_nothing_to_do() {
+        let (dir, repo) = scratch("commit-empty");
+        commit(&repo, &dir, "kept", "one\n", "first");
+        // A change that was never staged is not a reason to make a commit.
+        std::fs::write(dir.join("kept"), "two\n").unwrap();
+        assert!(!git::commit_staged(&repo, "nothing staged").unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reverting_the_newest_commit_leaves_no_revert_in_progress() {
+        let (dir, repo) = scratch("revert-clean");
+        commit(&repo, &dir, "conf", "good\n", "good config");
+        commit(&repo, &dir, "conf", "good\nbad\n", "add a bad line");
+
+        revert(&repo, "HEAD").unwrap();
+
+        // The undo is a new commit on top, and the file is back as it was.
+        assert_eq!(history::chain(&repo).unwrap().len(), 3);
+        assert_eq!(std::fs::read_to_string(dir.join("conf")).unwrap(), "good\n");
+        // Without cleaning up, every later `git status` claims a revert is in
+        // progress and other tools refuse to work.
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_conflicting_revert_changes_nothing_at_all() {
+        let (dir, repo) = scratch("revert-conflict");
+        commit(&repo, &dir, "conf", "good\n", "good config");
+        commit(&repo, &dir, "conf", "good\nbad\n", "add a bad line");
+        commit(&repo, &dir, "conf", "good\nbad\nmore\n", "add more");
+        let head = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+        // Undoing the middle commit cannot be applied on top of the third.
+        let middle = history::chain(&repo).unwrap()[1].to_string();
+        assert!(revert(&repo, &middle).is_err());
+
+        // Nothing half-applied: same commit, no conflict markers, no state.
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), head);
+        let contents = std::fs::read_to_string(dir.join("conf")).unwrap();
+        assert_eq!(contents, "good\nbad\nmore\n");
+        assert!(!contents.contains("<<<<<<<"));
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reverting_refuses_with_uncommitted_changes() {
+        let (dir, repo) = scratch("revert-dirty");
+        commit(&repo, &dir, "conf", "good\n", "good config");
+        commit(&repo, &dir, "conf", "good\nbad\n", "add a bad line");
+        std::fs::write(dir.join("conf"), "edited by hand\n").unwrap();
+
+        let err = revert(&repo, "HEAD").unwrap_err().to_string();
+        assert!(err.contains("uncommitted changes"), "{err}");
+        // The edit is still there.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("conf")).unwrap(),
+            "edited by hand\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reverting_refuses_while_stepped_back_through_the_history() {
+        let (dir, repo) = scratch("revert-stepped");
+        commit(&repo, &dir, "conf", "good\n", "good config");
+        commit(&repo, &dir, "conf", "good\nbad\n", "add a bad line");
+        step(&repo, history::Direction::Older).unwrap();
+
+        let err = revert(&repo, "HEAD").unwrap_err().to_string();
+        assert!(err.contains("stepped back"), "{err}");
+        assert_eq!(history::chain(&repo).unwrap().len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn maps_home_paths_relative_to_the_repository() {
