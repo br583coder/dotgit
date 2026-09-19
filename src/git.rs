@@ -388,6 +388,22 @@ pub fn status_entries(repo: &Repository) -> Result<Vec<FileStatus>> {
     Ok(entries)
 }
 
+/// Every path the repository tracks, from the index.
+///
+/// The status list only holds what has changed, so after committing it is
+/// empty. A front end that lets you open a file needs the committed ones too,
+/// or the moment you commit a file you can no longer reach it.
+pub fn tracked_files(repo: &Repository) -> Result<Vec<String>> {
+    let index = repo.index()?;
+    let mut paths: Vec<String> = index
+        .iter()
+        .filter_map(|entry| String::from_utf8(entry.path).ok())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 /// Stage one path, coping with a deletion, which has nothing left to add.
 pub fn stage_path(repo: &Repository, path: &str) -> Result<()> {
     let mut index = repo.index()?;

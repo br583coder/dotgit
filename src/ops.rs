@@ -416,6 +416,20 @@ mod tests {
     }
 
     #[test]
+    fn tracked_files_are_listed_after_they_are_committed() {
+        let (dir, repo) = scratch("tracked");
+        commit(&repo, &dir, "kept", "one\n", "first");
+        commit(&repo, &dir, "other", "two\n", "second");
+
+        // Nothing has changed, so the status list is empty...
+        assert!(git::status_entries(&repo).unwrap().is_empty());
+        // ...but both committed files are still reachable.
+        let tracked = git::tracked_files(&repo).unwrap();
+        assert_eq!(tracked, vec!["kept".to_string(), "other".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn committing_from_a_staging_area_honours_what_is_staged() {
         let (dir, repo) = scratch("commit-staged");
         commit(&repo, &dir, "kept", "one\n", "first");

@@ -258,6 +258,11 @@ struct App {
     dirty: bool,
     /// The right-hand pane: a title and the lines beneath it.
     main_title: String,
+    /// Whether the pane holds a patch, which decides whether lines are coloured
+    /// as a diff or as the file's own syntax.
+    main_is_diff: bool,
+    /// The language of the file shown in the pane, when it is not a patch.
+    main_language: highlight::Language,
     main_lines: Vec<String>,
     scroll: usize,
     /// Height of the diff pane's inside, from the last frame. Scrolling needs it
@@ -300,6 +305,8 @@ impl App {
             position: 0,
             dirty: false,
             main_title: String::new(),
+            main_is_diff: true,
+            main_language: highlight::Language::Plain,
             main_lines: Vec::new(),
             scroll: 0,
             main_height: 0,
@@ -352,7 +359,30 @@ impl App {
             .and_then(|url| git::host_of(&url))
             .unwrap_or_else(|| "(no remote)".into());
 
+        // Changed files first, then every other tracked file, so a file stays
+        // reachable after it has been committed - otherwise committing a file
+        // would be the last time you could open it here.
         self.files = git::status_entries(&self.repo).unwrap_or_default();
+        let changed: std::collections::HashSet<String> =
+            self.files.iter().map(|f| f.path.clone()).collect();
+        self.files.extend(
+            git::tracked_files(&self.repo)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|path| {
+                    if changed.contains(&path) {
+                        return None;
+                    }
+                    Some(git::FileStatus {
+                        path,
+                        // Two spaces where git would print a status letter.
+                        label: "  ".to_string(),
+                        staged: false,
+                        unstaged: false,
+                        untracked: false,
+                    })
+                }),
+        );
 
         self.commits = match history::chain(&self.repo) {
             Ok(chain) => chain
@@ -429,6 +459,7 @@ impl App {
             Panel::Status => {
                 self.main_title = " repository ".into();
                 self.main_lines = self.status_summary();
+                self.main_is_diff = true;
             }
             // Writing a message is about what is going into the commit, so show
             // that rather than leaving the pane on whatever was there before.
@@ -456,10 +487,27 @@ impl App {
             Panel::Files => match self.files.get(index) {
                 None => {
                     self.main_title = " diff ".into();
-                    self.main_lines = vec!["nothing changed".into()];
+                    self.main_lines = vec!["no files yet".into()];
+                    self.main_is_diff = true;
+                }
+                Some(file) if !file.staged && !file.unstaged && !file.untracked => {
+                    // A committed file: show what is in it, so you can read it
+                    // before opening it with `e`.
+                    self.main_title = format!(" {} ", file.path);
+                    self.main_is_diff = false;
+                    let path = self.root.join(&file.path);
+                    self.main_language = highlight::language_for(&path);
+                    self.main_lines = match std::fs::read_to_string(&path) {
+                        Ok(contents) => contents.lines().map(str::to_string).collect(),
+                        Err(err) => vec![format!("cannot read: {err}")],
+                    };
+                    if self.main_lines.is_empty() {
+                        self.main_lines = vec!["(empty file)".into()];
+                    }
                 }
                 Some(file) => {
                     self.main_title = format!(" {} ", file.path);
+                    self.main_is_diff = true;
                     self.main_lines = git::diff_for_path(&self.repo, &file.path)
                         .unwrap_or_else(|err| vec![format!("cannot diff: {err:#}")]);
                     if self.main_lines.is_empty() {
@@ -909,6 +957,12 @@ impl App {
             return Ok(());
         };
         let (path, staged, unstaged) = (file.path.clone(), file.staged, file.unstaged);
+        if !staged && !unstaged && !file.untracked {
+            // A committed file with no changes has nothing to stage; say so
+            // rather than appearing to do something.
+            self.message = format!("{path} has no changes to stage");
+            return Ok(());
+        }
         // A file with both staged and unstaged parts stages the rest, which is
         // the more useful reading of one keypress.
         let (command, outcome) = if unstaged || !staged {
@@ -927,7 +981,14 @@ impl App {
     }
 
     fn stage_all(&mut self) -> Result<()> {
-        let paths: Vec<String> = self.files.iter().map(|f| f.path.clone()).collect();
+        // Only the changed files: the panel also lists committed ones, and
+        // staging those would be a no-op with a misleading count.
+        let paths: Vec<String> = self
+            .files
+            .iter()
+            .filter(|f| f.staged || f.unstaged || f.untracked)
+            .map(|f| f.path.clone())
+            .collect();
         let outcome = paths
             .iter()
             .try_fold(0usize, |staged, path| {
@@ -942,6 +1003,10 @@ impl App {
         let Some(file) = self.files.get(self.selection()) else {
             return;
         };
+        if !file.staged && !file.unstaged && !file.untracked {
+            self.message = format!("{} has no changes to discard", file.path);
+            return;
+        }
         let verb = if file.untracked {
             "delete"
         } else {
@@ -1421,16 +1486,25 @@ impl App {
             .map(|file| {
                 // Green for what is staged, red for what is not: the colours
                 // lazygit uses, and the fastest way to read an index.
-                let colour = if file.staged && !file.unstaged {
+                let unchanged = !file.staged && !file.unstaged && !file.untracked;
+                let colour = if unchanged {
+                    Color::DarkGray
+                } else if file.staged && !file.unstaged {
                     Color::Green
                 } else if file.staged {
                     Color::Yellow
                 } else {
                     Color::Red
                 };
+                let path = if unchanged {
+                    // Committed files recede, so the changed ones still stand out.
+                    Span::styled(file.path.clone(), Style::new().fg(Color::Gray))
+                } else {
+                    Span::raw(file.path.clone())
+                };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{} ", file.label), Style::new().fg(colour)),
-                    Span::raw(file.path.clone()),
+                    path,
                 ]))
             })
             .collect();
@@ -1545,6 +1619,16 @@ impl App {
             .iter()
             .skip(self.scroll)
             .map(|line| {
+                if !self.main_is_diff {
+                    // A file's own contents, so highlight them as the language
+                    // they are rather than as a patch.
+                    return Line::from(
+                        highlight::highlight(self.main_language, line)
+                            .into_iter()
+                            .map(|span| Span::styled(span.text, style_for(span.kind)))
+                            .collect::<Vec<_>>(),
+                    );
+                }
                 // Patch colouring, by the first character of each line.
                 let style = match line.chars().next() {
                     Some('+') => Style::new().fg(Color::Green),

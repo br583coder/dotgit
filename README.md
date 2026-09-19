@@ -540,10 +540,18 @@ to a panel, `tab` cycles.
 | Panel        | Main pane shows                | Keys                                                      |
 |--------------|--------------------------------|-----------------------------------------------------------|
 | `1` status   | a summary of the repository    | `e` edit `dotgit.toml`, `E` in `$EDITOR`, `p` push, `b` back up, `L` log in |
-| `2` files    | the patch for the selected file| `e` edit, `E` in `$EDITOR`, `space` stage/unstage, `a` stage all, `d` discard, `u` upload |
+| `2` files    | the patch, or a committed file's contents | `e` edit, `E` in `$EDITOR`, `space` stage/unstage, `a` stage all, `d` discard, `u` upload |
 | `3` versions | the patch the commit introduced| `enter` move here, `r` back one, `f` forward one, `v` revert, `D` destroy |
 | `4` backups  | the bundle's path and size     | `n` new backup, `d` delete backup                          |
 | `5` commit   | what is staged for the commit  | type the message, `enter` commit and push, `ctrl-l` commit only |
+
+**The files panel lists every tracked file, not only the changed ones**, with the
+changed ones first. That matters because committing a file would otherwise be the last
+time you could open it here: once the tree is clean there would be nothing to select.
+Committed files are dimmed, the main pane shows their **contents** (syntax highlighted)
+rather than an empty diff, and `e` opens any of them. Staging or discarding one says it
+has no changes rather than appearing to do something, and `a` stages only what actually
+changed.
 
 Staged files show green, partly staged yellow, unstaged red. In the versions panel the
 `>` marker is the version your **working tree** holds, which is not necessarily the
@@ -603,6 +611,10 @@ push to` rather than reporting an error.
 
 Use `ctrl-l` when you want the commit without the push: an offline machine, or a repo
 whose remote you have not made yet.
+
+The whole loop therefore works from a clean checkout without leaving the TUI: `e` to
+edit a committed file, `:wq` to save it, `a` to stage it, `c` to write a message, and
+`Enter` to commit and push.
 
 ### Editing
 
