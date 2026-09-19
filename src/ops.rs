@@ -164,6 +164,33 @@ pub fn step(repo: &Repository, direction: history::Direction) -> Result<StepRepo
     Ok(StepReport::Moved(next))
 }
 
+/// Move the working tree to the version at `index` in the history, where 0 is
+/// the newest. Stepping is the one-at-a-time case of this; a front end showing
+/// the whole list can jump straight to the version the user picked.
+pub fn jump_to(repo: &Repository, index: usize) -> Result<history::Position> {
+    let chain = history::chain(repo)?;
+    let oid = *chain
+        .get(index)
+        .ok_or_else(|| DotgitError::from("no such version in this history"))?;
+
+    let current = history::current(repo)?;
+    if git::has_changes_against(repo, current.oid)? {
+        return Err(DotgitError::from(
+            "you have uncommitted changes - commit or discard them before moving to another version",
+        )
+        .into());
+    }
+
+    let position = history::Position {
+        oid,
+        index,
+        total: chain.len(),
+    };
+    git::checkout_tree_at(repo, oid)?;
+    history::save(repo, &position)?;
+    Ok(position)
+}
+
 /// A commit that `plan_drop` found, ready to be shown before anything happens.
 #[derive(Clone, Debug)]
 pub struct DoomedCommit {

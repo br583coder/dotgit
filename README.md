@@ -436,13 +436,14 @@ Enterprise login lives.
 
 ## `dotgit-tui` (optional)
 
-A full-screen browser for the repository: the version history on the left, details of
-the selected version on the right, and single keys for the common actions.
+A full-screen browser for the repository, laid out the way lazygit lays one out: a
+column of panels on the left, one of them focused, and a main pane on the right that
+always shows what the focused selection means.
 
 **It is entirely optional.** It is a separate binary, it is not built or installed
 unless you ask for it, and the `dotgit` command never launches it — there is no `tui`
-subcommand and nothing in the CLI depends on it. Every action it offers has a command
-line equivalent, listed in its own help pane (press `?`).
+subcommand and nothing in the CLI depends on it. Every action it offers names its
+command line equivalent in the help pane (`?`).
 
 Build and install it explicitly:
 
@@ -454,47 +455,66 @@ dotgit-tui
 It takes no arguments and runs in whichever repository you start it from.
 
 ```
-┌ dotgit ────────────────────────────────────────────────────────────────┐
-│ /home/you/dotfiles  [main]                                             │
-│ remote github.com   version 2 of 7 (1 back)   clean   3 backup(s)      │
-└────────────────────────────────────────────────────────────────────────┘
-┌ versions (newest first) ──────────────┐┌ details ──────────────────────┐
-│   3df1c6f tweak colorscheme (newest)  ││ add waybar config             │
-│ > a9a6fdd add waybar config           ││                               │
-│   82c02c8 first upload                ││ commit  a9a6fdd...            │
-│                                       ││ author  you                   │
-│                                       ││ date    20260912-183000 UTC   │
-└───────────────────────────────────────┘└───────────────────────────────┘
-┌────────────────────────────────────────────────────────────────────────┐
-│ restored to version 2 of 3                                             │
-│ r back  f forward  c commit  u upload  p push  b backup  ? keys  q quit│
-└────────────────────────────────────────────────────────────────────────┘
+┌ 1 status ─────────────────────────────┐┌ .zshrc ───────────────────────────────┐
+│ dotfiles [main]                       ││ diff --git a/.zshrc b/.zshrc          │
+│ github.com  v2 of 3  changes          ││ @@ -1,3 +1,3 @@                       │
+└───────────────────────────────────────┘│ -v2                                   │
+┌ 2 files ──────────────────────────────┐│ +v3                                   │
+│ M  .config/waybar/config              ││  line2                                │
+│  ? .vimrc                             ││ -line3                                │
+│  M .zshrc                             ││ +CHANGED                              │
+└───────────────────────────────────────┘│                                       │
+┌ 3 versions ───────────────────────────┐│                                       │
+│ > e8a8e1e tweak zshrc                 ││                                       │
+│   032e34c first upload                ││                                       │
+└───────────────────────────────────────┘│                                       │
+┌ 4 backups ────────────────────────────┐│                                       │
+│ dotfiles-20260918-023106.bundle  38K  ││                                       │
+└───────────────────────────────────────┘└───────────────────────────────────────┘
+─────────────────────────────────────────────────────────────────────────────────
+ staged .zshrc
+ space stage / unstage   a stage everything   d discard changes   c commit   u upload
+ tab panel  j/k move  J/K scroll  R refresh  ? keys  q quit
 ```
 
-The `>` marker is the point of the left pane: it shows which version your **working
-tree** currently holds, which is not necessarily the newest commit.
+The focused panel's border is highlighted, and **the footer lists only the keys that
+apply to it** — the rest of the interface stays out of the way. `1`-`4` jump straight
+to a panel, `tab` cycles.
 
-| Key     | Action                        | Same as                |
-|---------|-------------------------------|------------------------|
-| `j`/`k` | move through the versions     | —                      |
-| `r`     | step back one version         | `dotgit restore`       |
-| `f`     | step forward one version      | `dotgit rebase`        |
-| `c`     | commit (prompts for a message)| `dotgit commit --no-push` |
-| `u`     | upload a path into the repo   | `dotgit upload <path>` |
-| `p`     | push to the remote            | `dotgit commit`        |
-| `b`     | back up the history locally   | `dotgit backup`        |
-| `?`     | show the keys                 | —                      |
-| `q`     | quit                          | —                      |
+### What each panel does
 
-Committing in the TUI does not push, so that a commit never blocks on a login prompt;
-press `p` when you want to push. Pushing leaves the full-screen view first, because a
-push may hand over to `gh auth login`, and returns when it is done.
+| Panel        | Main pane shows                | Keys                                                      |
+|--------------|--------------------------------|-----------------------------------------------------------|
+| `1` status   | a summary of the repository    | `p` push, `b` back up, `L` log in                          |
+| `2` files    | the patch for the selected file| `space` stage/unstage, `a` stage all, `d` discard, `c` commit, `u` upload |
+| `3` versions | the patch the commit introduced| `enter` move here, `r` back one, `f` forward one, `D` destroy, `v` revert |
+| `4` backups  | the bundle's path and size     | `n` new backup, `d` delete backup                          |
 
-Both front ends call the same functions in `src/ops.rs`, so the TUI cannot drift from
-the CLI: stepping, uploading, committing and backing up behave identically either way,
-including the guard that refuses to step over uncommitted changes.
+Staged files show green, partly staged yellow, unstaged red. In the versions panel the
+`>` marker is the version your **working tree** holds, which is not necessarily the
+newest commit. `J`/`K` scroll a long patch without leaving the list.
 
-## How pushing works
+`enter` in the versions panel moves the working tree straight to the selected version,
+which the CLI can only reach by stepping (`dotgit restore` repeatedly) — the one thing
+the TUI does more directly than the command line.
+
+### Anything destructive asks first
+
+`d` (discard a file), `d` in the backups panel (delete a bundle) and `D` (destroy a
+commit) all open a confirmation box; only `y` proceeds, anything else cancels. `D`
+takes a backup bundle before destroying anything, exactly as [`dotgit pull`](#dotgit-pull)
+does, and refuses on any commit but the newest.
+
+Committing does not push, so a commit never blocks on a login prompt; press `p` when
+you want to push. Pushing and logging in leave the full-screen view first, because
+either may hand over to `gh auth login`, and return when it is done.
+
+Both front ends call the same functions in `src/ops.rs` and `src/git.rs`, so the TUI
+cannot drift from the CLI: staging, stepping, uploading, committing, destroying and
+backing up behave identically either way, including every guard — the TUI refuses to
+move to another version with uncommitted changes for the same reason the command does.
+
+## How pushing works## How pushing works
 
 `dotgit` reads the remote from `.git/config` (`git remote get-url origin`) and routes:
 
@@ -564,11 +584,11 @@ Source layout:
 |------------------|-----------------------------------------------------|
 | `src/main.rs`    | the `dotgit` binary: a shim over `cli::run`        |
 | `src/bin/dg.rs`  | the `dg` alias: the same shim                      |
-| `src/bin/dotgit-tui.rs` | the optional TUI (feature `tui`)            |
+| `src/bin/dotgit-tui.rs` | the optional lazygit-style TUI (feature `tui`) |
 | `src/cli.rs`     | CLI parsing, prompts and output                    |
 | `src/ops.rs`     | operations shared by both front ends               |
 | `src/fsops.rs`   | incremental, multi-threaded file copying           |
-| `src/git.rs`     | git2 operations: staging, commits, remotes, push   |
+| `src/git.rs`     | git2 operations: staging, commits, diffs, remotes, push |
 | `src/gh.rs`      | gh/glab auth: token discovery from CLI config files |
 | `src/history.rs` | the version cursor behind `restore` and `rebase`   |
 | `src/backup.rs`  | git bundles: writing, listing and pruning backups  |

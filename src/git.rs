@@ -285,6 +285,142 @@ pub fn reset_hard(repo: &Repository, oid: git2::Oid) -> Result<()> {
     Ok(())
 }
 
+/// One entry of the working tree's status, as a front end needs to show it.
+#[derive(Clone, Debug)]
+pub struct FileStatus {
+    pub path: String,
+    /// Two characters in git's own style: index state, then worktree state.
+    pub label: String,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub untracked: bool,
+}
+
+/// Every changed path in the repository, staged or not, including untracked
+/// files - a dotfiles repo tracks things `.gitignore` would normally hide, so
+/// they have to be visible to be stageable.
+pub fn status_entries(repo: &Repository) -> Result<Vec<FileStatus>> {
+    let mut options = git2::StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    let statuses = repo.statuses(Some(&mut options))?;
+
+    let mut entries = Vec::with_capacity(statuses.len());
+    for entry in statuses.iter() {
+        let Some(path) = entry.path() else { continue };
+        let status = entry.status();
+        let index = if status.is_index_new() {
+            'A'
+        } else if status.is_index_modified() {
+            'M'
+        } else if status.is_index_deleted() {
+            'D'
+        } else if status.is_index_renamed() {
+            'R'
+        } else {
+            ' '
+        };
+        let worktree = if status.is_wt_new() {
+            '?'
+        } else if status.is_wt_modified() {
+            'M'
+        } else if status.is_wt_deleted() {
+            'D'
+        } else {
+            ' '
+        };
+        entries.push(FileStatus {
+            path: path.to_string(),
+            label: format!("{index}{worktree}"),
+            staged: index != ' ',
+            unstaged: worktree != ' ',
+            untracked: status.is_wt_new() && !status.is_index_new(),
+        });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
+}
+
+/// Stage one path, coping with a deletion, which has nothing left to add.
+pub fn stage_path(repo: &Repository, path: &str) -> Result<()> {
+    let mut index = repo.index()?;
+    let full = repo_workdir(repo)?.join(path);
+    if full.exists() {
+        // FORCE, like `dotgit upload`: a dotfiles repo holds what it is told to.
+        index.add_all([path], IndexAddOption::FORCE, None)?;
+    } else {
+        index.remove_path(Path::new(path))?;
+    }
+    index.write()?;
+    Ok(())
+}
+
+/// Unstage one path by putting HEAD's version of it back in the index.
+pub fn unstage_path(repo: &Repository, path: &str) -> Result<()> {
+    let head = repo.head()?.peel_to_commit()?;
+    repo.reset_default(Some(head.as_object()), [path])?;
+    Ok(())
+}
+
+/// Throw away the working-tree changes to one path. An untracked file has no
+/// committed version to return to, so discarding it means deleting it.
+pub fn discard_path(repo: &Repository, path: &str, untracked: bool) -> Result<()> {
+    if untracked {
+        let full = repo_workdir(repo)?.join(path);
+        std::fs::remove_file(&full)
+            .map_err(|e| anyhow!("cannot remove {}: {e}", full.display()))?;
+        return Ok(());
+    }
+    let mut options = git2::build::CheckoutBuilder::new();
+    options.force().path(path);
+    repo.checkout_head(Some(&mut options))?;
+    Ok(())
+}
+
+/// The patch for one path, comparing the working tree against HEAD so both
+/// staged and unstaged changes to it are visible in one view.
+pub fn diff_for_path(repo: &Repository, path: &str) -> Result<Vec<String>> {
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    let mut options = git2::DiffOptions::new();
+    options
+        .pathspec(path)
+        .include_untracked(true)
+        .context_lines(3);
+    let diff = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut options))?;
+    patch_lines(&diff)
+}
+
+/// The patch a commit introduced, against its first parent.
+pub fn diff_for_commit(repo: &Repository, oid: git2::Oid) -> Result<Vec<String>> {
+    let commit = repo.find_commit(oid)?;
+    let tree = commit.tree()?;
+    // The first commit has no parent, so it is compared against nothing and
+    // every line reads as an addition.
+    let parent = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let mut options = git2::DiffOptions::new();
+    options.context_lines(3);
+    let diff = repo.diff_tree_to_tree(parent.as_ref(), Some(&tree), Some(&mut options))?;
+    patch_lines(&diff)
+}
+
+/// Render a diff as the lines of a unified patch, keeping the leading `+`/`-`
+/// so a caller can colour them.
+fn patch_lines(diff: &git2::Diff) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+        let content = String::from_utf8_lossy(line.content());
+        let content = content.trim_end_matches(['\n', '\r']);
+        lines.push(match line.origin() {
+            origin @ ('+' | '-' | ' ') => format!("{origin}{content}"),
+            _ => content.to_string(),
+        });
+        true
+    })?;
+    Ok(lines)
+}
+
 pub fn repo_workdir(repo: &Repository) -> Result<PathBuf> {
     repo.workdir()
         .map(PathBuf::from)
