@@ -17,17 +17,47 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use git2::Repository;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 
+use crate::config::{self, Source};
 use crate::{backup, gh, git, history, ops};
 
 pub fn run() -> Result<()> {
     let mut terminal = ratatui::init();
+    // The wheel is how most people scroll, so ask the terminal for mouse
+    // events. It is switched off again on the way out, including when an action
+    // hands the screen back temporarily, so a terminal is never left in a state
+    // where selecting text with the mouse has stopped working.
+    let mouse = capture_mouse(true);
     let result = App::new().and_then(|mut app| app.run(&mut terminal));
+    if mouse.is_ok() {
+        let _ = capture_mouse(false);
+    }
     ratatui::restore();
     result
+}
+
+/// Ask the terminal to report (or stop reporting) mouse events. A terminal that
+/// refuses is not an error: the keyboard still scrolls everything.
+fn capture_mouse(on: bool) -> std::io::Result<()> {
+    let mut out = std::io::stdout();
+    if on {
+        execute!(out, EnableMouseCapture)
+    } else {
+        execute!(out, DisableMouseCapture)
+    }
 }
 
 /// The four side panels, in the order they appear and in the order the number
@@ -68,11 +98,13 @@ impl Panel {
     fn keys(self) -> &'static [(&'static str, &'static str, &'static str)] {
         match self {
             Panel::Status => &[
+                ("e", "edit dotgit.toml", ""),
                 ("p", "push", "dotgit commit"),
                 ("b", "back up history", "dotgit backup"),
                 ("L", "log in to the remote", "dotgit login"),
             ],
             Panel::Files => &[
+                ("e", "edit in $EDITOR", ""),
                 ("space", "stage / unstage", "dotgit upload stages for you"),
                 ("a", "stage everything", ""),
                 ("d", "discard changes", ""),
@@ -163,8 +195,19 @@ struct App {
     main_title: String,
     main_lines: Vec<String>,
     scroll: usize,
+    /// Height of the diff pane's inside, from the last frame. Scrolling needs it
+    /// to stop at the point where the final line reaches the bottom, instead of
+    /// letting the content slide out of view entirely.
+    main_height: usize,
+    /// Where each panel was drawn, so a mouse event can be sent to whatever is
+    /// under the pointer rather than to whatever has focus.
+    main_area: Rect,
+    list_areas: [Rect; 4],
     message: String,
     mode: Mode,
+    /// Read once at start-up, so every action taken here lands in dotgit.log
+    /// exactly as the equivalent command would.
+    logging: config::Logging,
     quit: bool,
 }
 
@@ -187,8 +230,17 @@ impl App {
             main_title: String::new(),
             main_lines: Vec::new(),
             scroll: 0,
+            main_height: 0,
+            main_area: Rect::ZERO,
+            list_areas: [Rect::ZERO; 4],
             message: "? for keys, tab to change panel, q to quit".into(),
             mode: Mode::Browse,
+            // A broken config must not stop the interface from opening, so fall
+            // back to the defaults and say so in the status line.
+            logging: match config::Config::load() {
+                Ok(settings) => settings.logging,
+                Err(_) => config::Logging::default(),
+            },
             quit: false,
         };
         app.refresh()?;
@@ -398,15 +450,34 @@ impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             terminal.draw(|frame| self.draw(frame))?;
-            let Event::Key(key) = event::read()? else {
-                continue;
+            let key = match event::read()? {
+                Event::Key(key) => key,
+                Event::Mouse(mouse) => {
+                    self.mouse(mouse);
+                    continue;
+                }
+                _ => continue,
             };
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                self.quit = true;
-                continue;
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('c') => {
+                        self.quit = true;
+                        continue;
+                    }
+                    // Half a pane at a time, as in a pager.
+                    KeyCode::Char('d') => {
+                        self.scroll_main(self.half_pane());
+                        continue;
+                    }
+                    KeyCode::Char('u') => {
+                        self.scroll_main(-self.half_pane());
+                        continue;
+                    }
+                    _ => {}
+                }
             }
             match &self.mode {
                 Mode::Help => self.mode = Mode::Browse,
@@ -435,10 +506,17 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('g') => self.set_selection(0),
             KeyCode::Char('G') => self.set_selection(self.rows().saturating_sub(1)),
-            // The main pane scrolls with shifted keys, so a long patch can be
-            // read without leaving the list.
-            KeyCode::Char('J') | KeyCode::PageDown => self.scroll_main(5),
-            KeyCode::Char('K') | KeyCode::PageUp => self.scroll_main(-5),
+            // The diff pane scrolls with the shifted keys - a line at a time for
+            // reading code, half a pane at a time for covering ground - so the
+            // list keeps the plain ones.
+            KeyCode::Char('J') => self.scroll_main(1),
+            KeyCode::Char('K') => self.scroll_main(-1),
+            KeyCode::Home => self.scroll = 0,
+            KeyCode::End => self.scroll = self.max_scroll(),
+            // Page keys move through whichever list has focus, which is what
+            // makes a long version history navigable.
+            KeyCode::PageDown => self.page_selection(1),
+            KeyCode::PageUp => self.page_selection(-1),
             KeyCode::Char('R') => {
                 self.refresh()?;
                 self.message = "refreshed".into();
@@ -454,6 +532,9 @@ impl App {
             (_, KeyCode::Char('p')) => self.push(terminal)?,
             (_, KeyCode::Char('b')) | (Panel::Backups, KeyCode::Char('n')) => self.backup()?,
             (Panel::Status, KeyCode::Char('L')) => self.login(terminal)?,
+            (Panel::Status, KeyCode::Char('e')) => self.edit_config(terminal)?,
+
+            (Panel::Files, KeyCode::Char('e')) => self.edit_file(terminal)?,
 
             (Panel::Files, KeyCode::Char(' ')) => self.toggle_stage()?,
             (Panel::Files, KeyCode::Char('a')) => self.stage_all()?,
@@ -494,13 +575,57 @@ impl App {
         self.load_main();
     }
 
-    fn scroll_main(&mut self, delta: isize) {
-        let max = self.main_lines.len().saturating_sub(1);
-        let next = (self.scroll as isize + delta).clamp(0, max as isize);
-        self.scroll = next as usize;
+    /// The furthest the diff pane can scroll: far enough to bring the last line
+    /// into view, and no further, so the pane never ends up mostly empty.
+    fn max_scroll(&self) -> usize {
+        max_scroll(self.main_lines.len(), self.main_height)
     }
 
-    fn report(&mut self, outcome: Result<String>) {
+    fn half_pane(&self) -> isize {
+        (self.main_height / 2).max(1) as isize
+    }
+
+    fn scroll_main(&mut self, delta: isize) {
+        self.scroll = scrolled(self.scroll, delta, self.main_lines.len(), self.main_height);
+    }
+
+    /// Move a list's selection by one pane's worth of rows.
+    fn page_selection(&mut self, direction: isize) {
+        let rows = self.list_areas[self.slot()].height.saturating_sub(2).max(1) as isize;
+        self.move_selection(direction * rows);
+    }
+
+    /// Send a wheel event to whatever the pointer is over, falling back to the
+    /// diff pane, which is what people usually mean to scroll.
+    fn mouse(&mut self, mouse: ratatui::crossterm::event::MouseEvent) {
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollDown => 1,
+            MouseEventKind::ScrollUp => -1,
+            _ => return,
+        };
+        let point = Position::new(mouse.column, mouse.row);
+        for (slot, area) in self.list_areas.iter().enumerate() {
+            if area.contains(point) {
+                let panel = Panel::ALL[slot];
+                if self.focus != panel {
+                    self.focus(panel);
+                }
+                // Three rows per notch: one feels stuck, a whole pane overshoots.
+                self.move_selection(delta * 3);
+                return;
+            }
+        }
+        self.scroll_main(delta * 3);
+    }
+
+    /// Record what an action did and show it. Every action goes through here,
+    /// which is what keeps the log complete without dotting logging calls
+    /// through the interface.
+    fn report(&mut self, command: &str, outcome: Result<String>) {
+        if let Err(log_err) = self.logging.record(Source::Tui, command, &outcome) {
+            // Logging is not worth losing the action's own message over.
+            self.message = format!("logging failed: {log_err:#}");
+        }
         self.message = match outcome {
             Ok(message) => message,
             // A failed action is a message, not a crash: the user reads it and
@@ -529,11 +654,11 @@ impl App {
                     self.message = "nothing entered".into();
                     return Ok(());
                 }
-                let outcome = match kind {
-                    Input::CommitMessage => self.commit(&value),
-                    Input::UploadPath => self.upload(&value),
+                let (command, outcome) = match kind {
+                    Input::CommitMessage => ("commit", self.commit(&value)),
+                    Input::UploadPath => ("upload", self.upload(&value)),
                 };
-                self.report(outcome);
+                self.report(command, outcome);
                 self.refresh()?;
             }
             KeyCode::Backspace => {
@@ -559,12 +684,12 @@ impl App {
         let Mode::Confirm { action, .. } = previous else {
             return Ok(());
         };
-        let outcome = match action {
-            Pending::DestroyCommit => self.destroy_commit(),
-            Pending::DiscardFile(path, untracked) => self.discard(&path, untracked),
-            Pending::DeleteBackup(path) => self.delete_backup(&path),
+        let (command, outcome) = match action {
+            Pending::DestroyCommit => ("pull", self.destroy_commit()),
+            Pending::DiscardFile(path, untracked) => ("discard", self.discard(&path, untracked)),
+            Pending::DeleteBackup(path) => ("backup-delete", self.delete_backup(&path)),
         };
-        self.report(outcome);
+        self.report(command, outcome);
         self.refresh()
     }
 
@@ -575,23 +700,30 @@ impl App {
         let (path, staged, unstaged) = (file.path.clone(), file.staged, file.unstaged);
         // A file with both staged and unstaged parts stages the rest, which is
         // the more useful reading of one keypress.
-        let outcome = if unstaged || !staged {
-            git::stage_path(&self.repo, &path).map(|()| format!("staged {path}"))
+        let (command, outcome) = if unstaged || !staged {
+            (
+                "stage",
+                git::stage_path(&self.repo, &path).map(|()| format!("staged {path}")),
+            )
         } else {
-            git::unstage_path(&self.repo, &path).map(|()| format!("unstaged {path}"))
+            (
+                "unstage",
+                git::unstage_path(&self.repo, &path).map(|()| format!("unstaged {path}")),
+            )
         };
-        self.report(outcome);
+        self.report(command, outcome);
         self.refresh()
     }
 
     fn stage_all(&mut self) -> Result<()> {
         let paths: Vec<String> = self.files.iter().map(|f| f.path.clone()).collect();
-        let mut staged = 0;
-        for path in &paths {
-            git::stage_path(&self.repo, path)?;
-            staged += 1;
-        }
-        self.message = format!("staged {staged} file(s)");
+        let outcome = paths
+            .iter()
+            .try_fold(0usize, |staged, path| {
+                git::stage_path(&self.repo, path).map(|()| staged + 1)
+            })
+            .map(|staged| format!("staged {staged} file(s)"));
+        self.report("stage-all", outcome);
         self.refresh()
     }
 
@@ -660,11 +792,16 @@ impl App {
                 )
             }
         });
-        self.report(outcome);
+        self.report("jump", outcome);
         self.refresh()
     }
 
     fn step(&mut self, direction: history::Direction) -> Result<()> {
+        // The same names the command line uses for these two moves.
+        let command = match direction {
+            history::Direction::Older => "restore",
+            history::Direction::Newer => "rebase",
+        };
         let outcome = ops::step(&self.repo, direction).map(|report| match report {
             ops::StepReport::Boundary => match direction {
                 history::Direction::Older => "oldest change reached".to_string(),
@@ -676,7 +813,7 @@ impl App {
                 position.total
             ),
         });
-        self.report(outcome);
+        self.report(command, outcome);
         self.refresh()?;
         // Follow the cursor, so the list shows where the working tree now is.
         self.selected[2] = self.position;
@@ -721,7 +858,7 @@ impl App {
         let revision = commit.oid.to_string();
         let outcome = git::revert_commit(&self.repo, &revision)
             .map(|_| format!("reverted {} in a new commit", commit.id));
-        self.report(outcome);
+        self.report("revert", outcome);
         self.refresh()
     }
 
@@ -733,7 +870,7 @@ impl App {
                 ops::human_bytes(saved.bytes)
             )
         });
-        self.report(outcome);
+        self.report("backup", outcome);
         self.refresh()
     }
 
@@ -755,6 +892,49 @@ impl App {
         ))
     }
 
+    /// Open the selected file in the user's editor. A real editor beats
+    /// anything this interface could offer, so the screen is handed over for as
+    /// long as it runs and the panels are re-read when it exits.
+    fn edit_file(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let Some(file) = self.files.get(self.selection()) else {
+            self.message = "no file selected".into();
+            return Ok(());
+        };
+        let path = self.root.join(&file.path);
+        if !path.exists() {
+            // A deleted file has nothing to edit; opening it would quietly
+            // recreate it, which is not what pressing `e` asks for.
+            self.message = format!("{} no longer exists on disk", file.path);
+            return Ok(());
+        }
+        let shown = file.path.clone();
+        let outcome = self
+            .outside(terminal, |_| edit(&path))?
+            .map(|()| format!("edited {shown}"));
+        self.report("edit", outcome);
+        self.refresh()
+    }
+
+    /// Edit this repository's `dotgit.toml`, creating it if it is not there yet:
+    /// the settings the status panel reflects are the ones in that file.
+    fn edit_config(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let path = self.root.join("dotgit.toml");
+        let existed = path.exists();
+        let outcome = self.outside(terminal, |_| edit(&path))?.map(|()| {
+            if existed {
+                "edited dotgit.toml".to_string()
+            } else {
+                "wrote a new dotgit.toml".to_string()
+            }
+        });
+        self.report("edit-config", outcome);
+        // Settings may have changed, including where the log goes.
+        if let Ok(settings) = config::Config::load() {
+            self.logging = settings.logging;
+        }
+        self.refresh()
+    }
+
     /// Push, giving the terminal back first: a push may hand over to
     /// `gh auth login`, which needs the ordinary screen to talk to the user.
     fn push(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -767,7 +947,7 @@ impl App {
                 ops::PushReport::Local { target } => format!("pushed to {target}"),
             })
         })?;
-        self.report(outcome);
+        self.report("push", outcome);
         self.refresh()
     }
 
@@ -779,24 +959,46 @@ impl App {
             gh::forge_login(forge, &host)?;
             Ok(format!("logged in to {host}"))
         })?;
-        self.report(outcome);
+        self.report("login", outcome);
         self.refresh()
     }
 
-    /// Run something that needs the ordinary terminal, then come back.
+    /// Run something that needs the ordinary terminal - an editor, a login
+    /// prompt - then come back.
+    ///
+    /// The alternate screen and raw mode are turned off and on around it, but
+    /// the same terminal is kept throughout: building a new one asks the
+    /// terminal for its cursor position, and a program that has just been in
+    /// control may not answer in time, which fails the whole action.
     fn outside<T>(
         &mut self,
         terminal: &mut DefaultTerminal,
         action: impl FnOnce(&mut Self) -> T,
     ) -> Result<T> {
-        ratatui::restore();
+        // Mouse reporting has to go off with the full-screen view, or `gh auth
+        // login` would receive the wheel as gibberish on its prompt.
+        let _ = capture_mouse(false);
+        disable_raw_mode()?;
+        execute!(std::io::stdout(), LeaveAlternateScreen)?;
+
         let outcome = action(self);
-        *terminal = ratatui::init();
-        terminal.clear()?;
+
+        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        enable_raw_mode()?;
+        let _ = capture_mouse(true);
+        // The screen still holds whatever the program left behind, and the
+        // editor may have drawn over the alternate screen, so repaint from
+        // scratch. `Terminal::clear` would be the obvious call, but it asks the
+        // terminal where the cursor is and a program that has just had control
+        // may not answer in time, which fails the action. Resizing to the
+        // current size clears the viewport and resets the back buffer without
+        // that question.
+        let size = terminal.size()?;
+        terminal.resize(Rect::new(0, 0, size.width, size.height))?;
         Ok(outcome)
     }
 
-    fn draw(&self, frame: &mut Frame) {
+    fn draw(&mut self, frame: &mut Frame) {
         let rows =
             Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(frame.area());
         let columns = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
@@ -808,6 +1010,14 @@ impl App {
             Constraint::Min(3),
         ])
         .split(columns[0]);
+
+        // Remember the geometry: scrolling needs the pane height, and the mouse
+        // needs to know what sits where.
+        self.main_area = columns[1];
+        self.main_height = columns[1].height.saturating_sub(2) as usize;
+        self.list_areas = [side[0], side[1], side[2], side[3]];
+        // A pane that has shrunk may leave the view scrolled past the end.
+        self.scroll = self.scroll.min(self.max_scroll());
 
         self.draw_status(frame, side[0]);
         self.draw_files(frame, side[1]);
@@ -970,19 +1180,41 @@ impl App {
     }
 
     fn render_list(&self, frame: &mut Frame, area: Rect, panel: Panel, items: Vec<ListItem>) {
+        let slot = Panel::ALL.iter().position(|p| *p == panel).unwrap_or(0);
+        let selected = self.selected[slot];
+        let total = items.len();
+
         let mut state = ListState::default();
-        if self.focus == panel {
-            state.select(Some(
-                self.selected[Panel::ALL.iter().position(|p| *p == panel).unwrap_or(0)],
-            ));
-        }
+        // The selection is always set, so the list scrolls itself to keep the
+        // cursor in view; only its highlight depends on focus.
+        state.select(Some(selected));
+        let highlight = if self.focus == panel {
+            Style::new().reversed()
+        } else {
+            Style::new().add_modifier(Modifier::DIM)
+        };
         frame.render_stateful_widget(
             List::new(items)
                 .block(self.block(panel))
-                .highlight_style(Style::new().reversed()),
+                .highlight_style(highlight),
             area,
             &mut state,
         );
+
+        // A scrollbar appears only when the list is longer than its pane, so it
+        // says something when it is there.
+        let height = area.height.saturating_sub(2) as usize;
+        if total > height && height > 0 {
+            let mut bar = ScrollbarState::new(total.saturating_sub(height))
+                .position(selected.saturating_sub(height / 2).min(total - height));
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                area,
+                &mut bar,
+            );
+        }
     }
 
     fn draw_main(&self, frame: &mut Frame, area: Rect) {
@@ -1005,8 +1237,14 @@ impl App {
             })
             .collect();
 
-        let scrolled = if self.scroll > 0 {
-            format!("{}(+{} above) ", self.main_title, self.scroll)
+        // Say where in the content the view is, so scrolling has a reference
+        // point instead of an unmoored wall of text.
+        let total = self.main_lines.len();
+        let height = self.main_height.max(1);
+        let title = if total > height {
+            let first = self.scroll + 1;
+            let last = (self.scroll + height).min(total);
+            format!("{}lines {first}-{last} of {total} ", self.main_title,)
         } else {
             self.main_title.clone()
         };
@@ -1015,10 +1253,21 @@ impl App {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::new().fg(Color::DarkGray))
-                    .title(scrolled),
+                    .title(title),
             ),
             area,
         );
+
+        if total > height {
+            let mut bar = ScrollbarState::new(total - height).position(self.scroll);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                area,
+                &mut bar,
+            );
+        }
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
@@ -1031,7 +1280,7 @@ impl App {
             ));
             keys.push(Span::raw(format!("{what}   ")));
         }
-        let global = "tab panel  j/k move  J/K scroll  R refresh  ? keys  q quit";
+        let global = "tab panel  j/k move  pgup/pgdn page  J/K + ctrl-d/u scroll diff  wheel  ? keys  q quit";
         let lines = vec![
             Line::from(Span::styled(
                 self.message.clone(),
@@ -1114,7 +1363,13 @@ impl App {
         for (key, what) in [
             ("1-4 / tab", "change panel"),
             ("j / k", "move the selection"),
-            ("J / K", "scroll the diff"),
+            ("pgup/pgdn", "move the selection a pane at a time"),
+            ("g / G", "first / last item"),
+            ("J / K", "scroll the diff one line"),
+            ("ctrl-d/u", "scroll the diff half a pane"),
+            ("home/end", "top / bottom of the diff"),
+            ("wheel", "scroll whatever is under the pointer"),
+            ("e", "edit the selected file in $EDITOR"),
             ("p", "push"),
             ("b", "back up the history"),
             ("R", "refresh"),
@@ -1145,6 +1400,63 @@ impl App {
     }
 }
 
+/// Run the user's editor on `path` and wait for it to close.
+///
+/// The command is passed to a shell with the path as an argument rather than
+/// pasted into the string, so an editor set to something like `code -w` works
+/// and a path with spaces or quotes in it cannot be misread as more arguments.
+fn edit(path: &std::path::Path) -> Result<()> {
+    let editor = editor_command()?;
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(path)
+        .status()
+        .map_err(|e| anyhow!("cannot run {editor}: {e}"))?;
+    if !status.success() {
+        return Err(anyhow!("{editor} exited without saving"));
+    }
+    Ok(())
+}
+
+/// `$VISUAL`, then `$EDITOR`, then `vi` if it is installed. Guessing further
+/// would be worse than saying so.
+fn editor_command() -> Result<String> {
+    for name in ["VISUAL", "EDITOR"] {
+        if let Ok(value) = std::env::var(name) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+    if std::process::Command::new("sh")
+        .args(["-c", "command -v vi >/dev/null"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return Ok("vi".to_string());
+    }
+    Err(anyhow!(
+        "no editor found - set $EDITOR (for example `export EDITOR=nvim`)"
+    ))
+}
+
+/// The furthest a pane of `height` rows can scroll through `total` lines: far
+/// enough to bring the last line into view, and no further, so the pane never
+/// ends up mostly empty below the end of the content.
+fn max_scroll(total: usize, height: usize) -> usize {
+    total.saturating_sub(height.max(1))
+}
+
+/// Move a scroll position by `delta`, stopping at either end.
+fn scrolled(current: usize, delta: isize, total: usize, height: usize) -> usize {
+    let max = max_scroll(total, height) as isize;
+    (current as isize + delta).clamp(0, max) as usize
+}
+
 /// A box of the given size in the middle of `area`, clamped so it still fits on
 /// a small terminal.
 fn centred(area: Rect, width: u16, height: u16) -> Rect {
@@ -1155,5 +1467,46 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
         y: area.y + (area.height - height) / 2,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_shorter_than_the_pane_cannot_scroll() {
+        assert_eq!(max_scroll(10, 34), 0);
+        assert_eq!(scrolled(0, 5, 10, 34), 0);
+    }
+
+    #[test]
+    fn scrolling_stops_with_the_last_line_in_view() {
+        // 242 lines in a 34-row pane: the final view starts at line 209.
+        assert_eq!(max_scroll(242, 34), 208);
+        assert_eq!(scrolled(200, 100, 242, 34), 208);
+        assert_eq!(scrolled(208, 1, 242, 34), 208);
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_top() {
+        assert_eq!(scrolled(0, -1, 242, 34), 0);
+        assert_eq!(scrolled(3, -10, 242, 34), 0);
+    }
+
+    #[test]
+    fn a_line_and_a_half_pane_move_by_the_amounts_they_promise() {
+        assert_eq!(scrolled(10, 1, 242, 34), 11);
+        assert_eq!(scrolled(10, -1, 242, 34), 9);
+        // Half of a 34-row pane.
+        assert_eq!(scrolled(10, 17, 242, 34), 27);
+        assert_eq!(scrolled(27, -17, 242, 34), 10);
+    }
+
+    #[test]
+    fn a_pane_of_no_height_does_not_divide_by_zero() {
+        // The first frame has not been drawn yet, so the height is still zero.
+        assert_eq!(max_scroll(242, 0), 241);
+        assert_eq!(scrolled(0, 1, 242, 0), 1);
     }
 }
