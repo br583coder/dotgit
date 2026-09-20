@@ -358,7 +358,11 @@ pub fn highlight(language: Language, line: &str) -> Vec<Span> {
         // Words: a keyword, a constant, a key name, or ordinary text.
         if is_word_start(c) {
             let start = index;
-            let mut text = String::new();
+            // Always take the first character, then continue while the rest look
+            // like a word. Consuming it unconditionally is what guarantees the
+            // loop advances, whatever `is_word_start` and `is_word` disagree on.
+            let mut text = String::from(c);
+            index += 1;
             while index < chars.len() && is_word(chars[index]) {
                 text.push(chars[index]);
                 index += 1;
@@ -440,7 +444,7 @@ fn is_word_start(c: char) -> bool {
 /// A colon is deliberately not part of a word: `name: value` in YAML has to
 /// split there for the key to be recognised.
 fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '-' || c == '$'
+    c.is_alphanumeric() || c == '_' || c == '-' || c == '$' || c == '@'
 }
 
 fn flush(spans: &mut Vec<Span>, plain: &mut String) {
@@ -593,6 +597,27 @@ mod tests {
         assert_eq!(of("script.py"), Language::Python);
         // Something unrecognised is left alone rather than guessed at.
         assert_eq!(of("mystery.xyz"), Language::Plain);
+    }
+
+    #[test]
+    fn a_character_that_starts_a_word_but_is_not_one_still_advances() {
+        // `@` could start a word but was not a word character, so the tokeniser
+        // never moved past it and looped forever. A diff hunk header is the
+        // line that found it.
+        for line in [
+            "@@ -1,2 +1,2 @@",
+            "@",
+            "@@",
+            "user@example.com",
+            "$PATH and @tag and _x",
+            "@@@ nonsense @@@",
+        ] {
+            let joined: String = highlight(Language::Shell, line)
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect();
+            assert_eq!(joined, line, "{line:?} was mangled");
+        }
     }
 
     #[test]

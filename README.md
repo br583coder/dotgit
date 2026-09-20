@@ -15,6 +15,7 @@ history in case the remote ever disappears.
 | `dotgit new <name>`      | create the repo on GitHub or GitLab and wire up `origin` |
 | `dotgit upload <paths>`  | copy files from your machine into the repo and stage them |
 | `dotgit commit`          | stage everything, commit, and push                    |
+| `dotgit push`            | push commits you already made, no message needed      |
 | `dotgit restore`         | step the working tree back one version                |
 | `dotgit rebase`          | step the working tree forward one version             |
 | `dotgit revert [commit]` | reverse an earlier commit and push the result         |
@@ -292,6 +293,32 @@ pushed to github.com as octocat
 If nothing changed, it prints `nothing to commit, working tree clean` and simply
 pushes. An empty message aborts.
 
+### `dotgit push`
+
+Pushes what is already committed. No message, no new commit — for commits made with
+`dotgit commit --no-push`, made in the TUI with `ctrl-l`, made with plain `git`, or for
+retrying a push that failed.
+
+```
+$ dotgit push
+pushing 2 commit(s) on master
+pushed to github.com as octocat
+```
+
+It says how many commits are going, and tells you when the answer is none rather than
+appearing to do something:
+
+```
+$ dotgit push
+nothing to push: master matches origin/master
+```
+
+Credentials are found the same way as for any other push — the `gh`/`glab` login for the
+remote's host, or `GITLAB_TOKEN` — and a repository with no `origin` says so.
+
+In the TUI, `p` pushes from any panel, and `ctrl-p` in the message panel pushes on its
+own when you have not written a message.
+
 ### `dotgit revert [commit]`
 
 Creates a new commit that reverses an earlier commit, then pushes it to the
@@ -509,31 +536,36 @@ dotgit status
 It takes no arguments and runs in whichever repository you start it from.
 
 ```
-┌ 1 status ─────────────────────────────┐┌ .zshrc ───────────────────────────────┐
+┌ 1 · STATUS ───────────────────────────┐┌ .zshrc ───────────────────────────────┐
 │ dotfiles [main]                       ││ diff --git a/.zshrc b/.zshrc          │
 │ github.com  v2 of 3  changes          ││ @@ -1,3 +1,3 @@                       │
 └───────────────────────────────────────┘│ -v2                                   │
-┌ 2 files ──────────────────────────────┐│ +v3                                   │
-│ M  .config/waybar/config              ││  line2                                │
-│  ? .vimrc                             ││ -line3                                │
-│  M .zshrc                             ││ +CHANGED                              │
+┏ 2 · FILES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓│ +v3                                   │
+┃ ▌ ○  M .config/waybar/config          ┃│  line2                                │
+┃   ●  A .vimrc                         ┃│ -line3                                │
+┃      ​  .zshrc                         ┃│ +CHANGED                              │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛│                                       │
+┌ 3 · VERSIONS ─────────────────────────┐│                                       │
+│   ● e8a8e1e tweak zshrc               ││                                       │
+│   │ 032e34c first upload              ││                                       │
 └───────────────────────────────────────┘│                                       │
-┌ 3 versions ───────────────────────────┐│                                       │
-│ > e8a8e1e tweak zshrc                 ││                                       │
-│   032e34c first upload                ││                                       │
-└───────────────────────────────────────┘│                                       │
-┌ 4 backups ────────────────────────────┐│                                       │
-│ dotfiles-20260918-023106.bundle  38K  ││                                       │
+┌ 4 · BACKUPS ──────────────────────────┐│                                       │
+│   dotfiles-20260918-023106.bundle 38K ││                                       │
 └───────────────────────────────────────┘└───────────────────────────────────────┘
-─────────────────────────────────────────────────────────────────────────────────
+┌ 5 · MESSAGE ────────────────────────────────────────────────────────────────────┐
+│ press c to write a commit message                                               │
+└─────────────────────────────────────────────────────────────────────────────────┘
+──────────────────────────────────────────────────────────────────────────────────
  staged .zshrc
- space stage / unstage   a stage everything   d discard changes   c commit   u upload
- tab panel  j/k move  J/K scroll  R refresh  ? keys  q quit
+ e edit · E $EDITOR · space stage · a stage all · d discard · u upload
+ 1-5 panel · tab cycle · j/k move · J/K scroll diff · ? keys · q quit
 ```
 
-The focused panel's border is highlighted, and **the footer lists only the keys that
-apply to it** — the rest of the interface stays out of the way. `1`-`4` jump straight
-to a panel, `tab` cycles.
+**The focused panel is drawn with a heavy border** and its title in the accent colour,
+so which keys are live is obvious at a glance; the others recede into thin grey. The
+selected row carries a left accent bar rather than being reversed, and the hint bar
+below lists only the focused panel's keys — terse, with the full wording in `?`. `1`-`5`
+jump straight to a panel, `tab` cycles. Corners are square throughout.
 
 ### What each panel does
 
@@ -543,7 +575,7 @@ to a panel, `tab` cycles.
 | `2` files    | the patch, or a committed file's contents | `e` edit, `E` in `$EDITOR`, `space` stage/unstage, `a` stage all, `d` discard, `u` upload |
 | `3` versions | the patch the commit introduced| `enter` move here, `r` back one, `f` forward one, `v` revert, `D` destroy |
 | `4` backups  | the bundle's path and size     | `n` new backup, `d` delete backup                          |
-| `5` commit   | what is staged for the commit  | type the message, `enter` commit and push, `ctrl-l` commit only |
+| `5` commit   | what is staged for the commit  | `c` opens the message dialog, `enter` commit and push |
 
 **The files panel lists every tracked file, not only the changed ones**, with the
 changed ones first. That matters because committing a file would otherwise be the last
@@ -553,7 +585,10 @@ rather than an empty diff, and `e` opens any of them. Staging or discarding one 
 has no changes rather than appearing to do something, and `a` stages only what actually
 changed.
 
-Staged files show green, partly staged yellow, unstaged red. In the versions panel the
+A filled `●` marks a staged file and a hollow `○` one that is not, alongside git's own
+two-letter status: green for staged, amber for partly staged, red for unstaged, grey for
+a committed file with no changes. In the versions panel `●` is the version in your
+working tree. In the versions panel the
 `>` marker is the version your **working tree** holds, which is not necessarily the
 newest commit.
 
@@ -570,10 +605,12 @@ it holds more than fits:
 | `J` / `K`           | the diff pane, one line                                    |
 | `ctrl-d` / `ctrl-u` | the diff pane, half a pane                                 |
 | `Home` / `End`      | top / bottom of the diff pane                              |
-| mouse wheel         | whatever is under the pointer                              |
+| mouse wheel         | whatever is under the pointer — one row per notch in a list |
 
 The wheel scrolls the pane you point at, and focuses a side panel if you scroll over
-one. The diff pane's title shows where you are — `lines 35-68 of 242` — and scrolling
+one. In a list it moves **one row per notch**, the same as `j`/`k`, so you can land on
+the row you want; over the diff it moves three lines, since that is text rather than a
+list of things. The diff pane's title shows where you are — `lines 35-68 of 242` — and scrolling
 stops when the last line reaches the bottom rather than letting the text slide out of
 view. Every panel keeps its own position, so switching panels and coming back returns
 you to the same place in the history.
@@ -584,24 +621,46 @@ the TUI does more directly than the command line.
 
 ### Committing and pushing
 
-The commit message is a **panel, not a pop-up**. Press `c` from anywhere and the cursor
-moves to the message panel along the bottom of the window; type the message in place.
-Nothing overlays the screen, so the staged files and the diff stay visible while you
-write, and the draft survives leaving the panel — `Esc` goes back to the files, and `c`
-brings you back to the message exactly as you left it.
+`c` from anywhere opens the **commit message dialog**, which has the two halves a git
+commit message has, with a separator between them:
+
+```
+┏ COMMIT MESSAGE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ fix waybar                                                       ┃
+┃ ──  description ─────────────────────────────────────────────────┃
+┃ the clock module was too wide                                    ┃
+┃ on the second monitor                                            ┃
+┃                                                                  ┃
+┃ writing the description                                          ┃
+┃ down/up or tab switch field   enter (from the header) commits and ┃
+┃ pushes   ctrl-l commits locally   esc closes, keeping the draft   ┃
+┗ 1 staged ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+```
 
 | Key | Action |
 |---|---|
-| any character | write the message |
-| `Enter` | commit what is staged **and push** |
+| any character | write into the current field |
+| `Down` / `Up` / `Tab` | move between the header and the description |
+| `Enter` | from the header: commit **and push**; in the description: a new line |
+| `ctrl-p` | commit and push from either field (or push alone if nothing is written) |
 | `ctrl-l` | commit locally, without pushing |
-| `Esc` | back to the files, keeping the draft |
+| `Esc` | close the dialog, keeping the draft |
 
-While the panel has focus the main pane lists **what is actually going into the
-commit**, and the commit takes exactly that: the index, not the working tree. Unstaging
-a file with `space` means it is left out, which is the point of having a staging area.
-Committing with nothing staged says so rather than sweeping up every change, and an
-empty message is refused.
+The separator is the blank line git puts between a commit's header and its body, so
+`git log --oneline` shows the header and `git show` shows the whole message. The
+description is optional — a header alone is a complete message — but a description with
+no header is refused rather than promoted to one.
+
+`Esc` keeps what you have written: the draft survives closing the dialog and browsing
+the other panels, and `c` brings it back as you left it. It lives in memory, so quitting
+dotgit discards it.
+
+Panel 5 shows the draft while you browse and commits it with `Enter`, so the commit
+itself is still reachable without reopening the dialog. The main pane lists **what is
+actually going into the commit** while the panel has focus, and the commit takes exactly
+that: the index, not the working tree. Unstaging a file with `space` means it is left
+out, which is the point of having a staging area. Committing with nothing staged says so
+rather than sweeping up every change.
 
 **`Enter` commits and pushes**, the same as `dotgit commit` on the command line. The
 push only happens if the commit succeeded, and a push that fails never hides the commit

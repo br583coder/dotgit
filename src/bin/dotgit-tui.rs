@@ -28,8 +28,8 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::prelude::*;
 use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
 use crate::config::{self, Source};
@@ -90,11 +90,11 @@ impl Panel {
 
     fn title(self) -> &'static str {
         match self {
-            Panel::Status => " 1 status ",
-            Panel::Files => " 2 files ",
-            Panel::Versions => " 3 versions ",
-            Panel::Backups => " 4 backups ",
-            Panel::Commit => " 5 commit message ",
+            Panel::Status => " 1 · STATUS ",
+            Panel::Files => " 2 · FILES ",
+            Panel::Versions => " 3 · VERSIONS ",
+            Panel::Backups => " 4 · BACKUPS ",
+            Panel::Commit => " 5 · MESSAGE ",
         }
     }
 
@@ -111,44 +111,84 @@ impl Panel {
     /// The keys that do something in this panel, for the footer and the help
     /// pane. Each carries the command that does the same thing, so the TUI
     /// keeps teaching the CLI rather than replacing it.
-    fn keys(self) -> &'static [(&'static str, &'static str, &'static str)] {
+    fn keys(self) -> &'static [(&'static str, &'static str, &'static str, &'static str)] {
         match self {
             Panel::Status => &[
-                ("e", "edit dotgit.toml here", ""),
-                ("E", "edit it in $EDITOR", ""),
-                ("p", "push", "dotgit commit"),
-                ("b", "back up history", "dotgit backup"),
-                ("L", "log in to the remote", "dotgit login"),
+                ("e", "config", "edit dotgit.toml here", ""),
+                ("E", "$EDITOR", "edit it in $EDITOR", ""),
+                ("p", "push", "push what is committed", "dotgit push"),
+                ("b", "backup", "back up the history", "dotgit backup"),
+                ("L", "log in", "log in to the remote", "dotgit login"),
             ],
             Panel::Files => &[
-                ("e", "edit here (vim keys)", ""),
-                ("E", "edit in $EDITOR", ""),
-                ("space", "stage / unstage", "dotgit upload stages for you"),
-                ("a", "stage everything", ""),
-                ("d", "discard changes", ""),
-                ("c", "commit staged work", "dotgit commit --no-push"),
-                ("u", "upload a path", "dotgit upload <path>"),
+                ("e", "edit", "edit here, with vim keys", ""),
+                ("E", "$EDITOR", "edit in $EDITOR", ""),
+                ("space", "stage", "stage or unstage the file", ""),
+                ("a", "stage all", "stage everything changed", ""),
+                ("d", "discard", "discard the file's changes", ""),
+                (
+                    "u",
+                    "upload",
+                    "upload a path into the repo",
+                    "dotgit upload <path>",
+                ),
             ],
             Panel::Versions => &[
-                ("enter", "move here", ""),
-                ("r", "back one version", "dotgit restore"),
-                ("f", "forward one version", "dotgit rebase"),
-                ("D", "destroy this commit", "dotgit pull"),
-                ("v", "revert this commit", "dotgit revert <sha>"),
+                ("enter", "move here", "move the tree to this version", ""),
+                ("r", "back", "back one version", "dotgit restore"),
+                ("f", "forward", "forward one version", "dotgit rebase"),
+                (
+                    "v",
+                    "revert",
+                    "add a commit undoing this one",
+                    "dotgit revert <sha>",
+                ),
+                (
+                    "D",
+                    "destroy",
+                    "destroy this commit for good",
+                    "dotgit pull",
+                ),
             ],
             Panel::Backups => &[
-                ("n", "new backup", "dotgit backup"),
-                ("d", "delete backup", ""),
+                ("n", "new", "write a new backup", "dotgit backup"),
+                ("d", "delete", "delete this backup", ""),
             ],
             Panel::Commit => &[
-                ("type", "write the message", ""),
-                ("enter", "commit and push", "dotgit commit"),
-                ("ctrl-l", "commit locally only", "dotgit commit --no-push"),
-                ("esc", "back to the files", ""),
+                ("c", "write", "write the commit message", ""),
+                (
+                    "enter",
+                    "commit + push",
+                    "commit what is staged and push",
+                    "dotgit commit",
+                ),
+                (
+                    "ctrl-l",
+                    "commit only",
+                    "commit without pushing",
+                    "dotgit commit --no-push",
+                ),
+                ("ctrl-p", "push", "push, or commit and push", "dotgit push"),
+                ("esc", "back", "back to the files", ""),
             ],
         }
     }
 }
+
+/// Accent for anything focused or interactive.
+const ACCENT: Color = Color::Indexed(39);
+/// Success, and staged work.
+const OK: Color = Color::Indexed(114);
+/// Attention, and partly staged work.
+const WARN: Color = Color::Indexed(179);
+/// Danger, and unstaged work.
+const BAD: Color = Color::Indexed(203);
+/// Secondary text.
+const MUTED: Color = Color::Indexed(245);
+/// Borders and rules that should recede.
+const FAINT: Color = Color::Indexed(240);
+/// The background behind a selected row.
+const SELECTED_BG: Color = Color::Indexed(236);
 
 /// The cursor shapes the interface asks the terminal for.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -183,6 +223,15 @@ impl Shape {
     }
 }
 
+/// Which half of the commit message is being typed into.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    /// The one-line header, which is what `git log --oneline` shows.
+    Subject,
+    /// The longer description beneath it.
+    Body,
+}
+
 struct CommitRow {
     oid: git2::Oid,
     id: String,
@@ -209,6 +258,8 @@ enum Pending {
 
 enum Mode {
     Browse,
+    /// Writing a commit message: a header, a separator, and the description.
+    Commit,
     /// The built-in modal editor has the screen.
     Edit(Box<Editor>),
     Input {
@@ -252,8 +303,12 @@ struct App {
     backups: Vec<BackupRow>,
     /// Selection per panel, indexed the way [`Panel::ALL`] is ordered.
     selected: [usize; 5],
-    /// The commit message being written in panel 5.
-    message_draft: String,
+    /// The commit message being written in panel 5: a header line and, below
+    /// it, the longer description. They are joined the way git expects, with a
+    /// blank line between them.
+    subject: String,
+    body: String,
+    field: Field,
     position: usize,
     dirty: bool,
     /// The right-hand pane: a title and the lines beneath it.
@@ -301,7 +356,9 @@ impl App {
             commits: Vec::new(),
             backups: Vec::new(),
             selected: [0; 5],
-            message_draft: String::new(),
+            subject: String::new(),
+            body: String::new(),
+            field: Field::Subject,
             position: 0,
             dirty: false,
             main_title: String::new(),
@@ -518,10 +575,12 @@ impl App {
             Panel::Versions => match self.commits.get(index) {
                 None => {
                     self.main_title = " version ".into();
+                    self.main_is_diff = true;
                     self.main_lines = vec!["no commits yet".into()];
                 }
                 Some(commit) => {
                     self.main_title = format!(" {} ", commit.id);
+                    self.main_is_diff = true;
                     let mut lines = vec![
                         commit.subject.clone(),
                         String::new(),
@@ -540,6 +599,7 @@ impl App {
             Panel::Backups => match self.backups.get(index) {
                 None => {
                     self.main_title = " backups ".into();
+                    self.main_is_diff = true;
                     self.main_lines = vec![
                         "no backups of this repository yet".into(),
                         String::new(),
@@ -548,6 +608,7 @@ impl App {
                 }
                 Some(row) => {
                     self.main_title = format!(" {} ", row.name);
+                    self.main_is_diff = true;
                     self.main_lines = vec![
                         format!("path   {}", row.path.display()),
                         format!("size   {}", ops::human_bytes(row.bytes)),
@@ -629,13 +690,17 @@ impl App {
                     // commit local, for an offline machine or a repo with no
                     // remote yet.
                     KeyCode::Char('p')
-                        if self.focus == Panel::Commit && matches!(self.mode, Mode::Browse) =>
+                        if matches!(self.mode, Mode::Commit)
+                            || (self.focus == Panel::Commit
+                                && matches!(self.mode, Mode::Browse)) =>
                     {
                         self.commit_draft(true, terminal)?;
                         continue;
                     }
                     KeyCode::Char('l')
-                        if self.focus == Panel::Commit && matches!(self.mode, Mode::Browse) =>
+                        if matches!(self.mode, Mode::Commit)
+                            || (self.focus == Panel::Commit
+                                && matches!(self.mode, Mode::Browse)) =>
                     {
                         self.commit_draft(false, terminal)?;
                         continue;
@@ -645,6 +710,7 @@ impl App {
             }
             match &self.mode {
                 Mode::Edit(_) => self.edit_key(key)?,
+                Mode::Commit => self.commit_dialog_key(key.code, terminal)?,
                 Mode::Help => self.mode = Mode::Browse,
                 Mode::Confirm { .. } => self.confirm_key(key.code)?,
                 Mode::Input { kind, buffer } => {
@@ -675,9 +741,6 @@ impl App {
     }
 
     fn browse_key(&mut self, code: KeyCode, terminal: &mut DefaultTerminal) -> Result<()> {
-        if self.focus == Panel::Commit {
-            return self.commit_panel_key(code, terminal);
-        }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('?') => self.mode = Mode::Help,
@@ -711,20 +774,34 @@ impl App {
         Ok(())
     }
 
-    /// The commit panel takes text, so only a few keys are commands here.
-    fn commit_panel_key(&mut self, code: KeyCode, terminal: &mut DefaultTerminal) -> Result<()> {
+    /// Keys inside the commit dialog.
+    fn commit_dialog_key(&mut self, code: KeyCode, terminal: &mut DefaultTerminal) -> Result<()> {
         match code {
-            // Leaving keeps the draft: a message half-written is not lost by
-            // looking at a diff.
-            KeyCode::Esc => self.focus(Panel::Files),
-            KeyCode::Tab => self.focus(self.focus.next()),
-            KeyCode::BackTab => self.focus(self.focus.previous()),
-            // The same thing `dotgit commit` does: commit, then push.
-            KeyCode::Enter => self.commit_draft(true, terminal)?,
-            KeyCode::Backspace => {
-                self.message_draft.pop();
+            // Closing keeps the draft, so a message survives a look at the diff.
+            KeyCode::Esc => {
+                self.mode = Mode::Browse;
+                self.focus(Panel::Commit);
             }
-            KeyCode::Char(c) => self.message_draft.push(c),
+            // Down, Up and Tab all move between the two fields, whichever the
+            // user reaches for.
+            KeyCode::Down | KeyCode::Tab => self.field = Field::Body,
+            KeyCode::Up | KeyCode::BackTab => self.field = Field::Subject,
+            KeyCode::Enter => match self.field {
+                // From the header, Enter is the fast path: commit and push.
+                Field::Subject => self.commit_draft(true, terminal)?,
+                // In the description it is what it looks like: a new line.
+                Field::Body => self.body.push('\n'),
+            },
+            KeyCode::Backspace => {
+                match self.field {
+                    Field::Subject => self.subject.pop(),
+                    Field::Body => self.body.pop(),
+                };
+            }
+            KeyCode::Char(c) => match self.field {
+                Field::Subject => self.subject.push(c),
+                Field::Body => self.body.push(c),
+            },
             _ => {}
         }
         Ok(())
@@ -732,8 +809,20 @@ impl App {
 
     /// Commit what is staged with the message in the panel, and optionally push.
     fn commit_draft(&mut self, push_after: bool, terminal: &mut DefaultTerminal) -> Result<()> {
-        let message = self.message_draft.trim().to_string();
+        if self.subject.trim().is_empty() && !self.body.trim().is_empty() {
+            // A description with no header would make `git log --oneline`
+            // useless, so ask for the header rather than inventing one.
+            self.message = "write a header line before the description".into();
+            return Ok(());
+        }
+        let message = compose_message(&self.subject, &self.body);
         if message.is_empty() {
+            // Nothing to commit, so the useful reading of "commit and push" is
+            // just the push. `Enter` still asks for a message, since committing
+            // is what it is for.
+            if push_after {
+                return self.push(terminal);
+            }
             self.message = "write a commit message first".into();
             return Ok(());
         }
@@ -744,7 +833,12 @@ impl App {
         let Some(committed) = committed else {
             return Ok(());
         };
-        self.message_draft.clear();
+        self.subject.clear();
+        self.body.clear();
+        self.field = Field::Subject;
+        self.mode = Mode::Browse;
+        // Nothing is left to commit, so put the cursor back on the files.
+        self.focus = Panel::Files;
         self.refresh()?;
 
         if !push_after {
@@ -790,9 +884,11 @@ impl App {
 
             (Panel::Files, KeyCode::Char(' ')) => self.toggle_stage()?,
             (Panel::Files, KeyCode::Char('a')) => self.stage_all()?,
-            // No dialog: `c` moves to the message panel, where the message is
-            // typed in place.
-            (_, KeyCode::Char('c')) => self.focus(Panel::Commit),
+            // `c` opens the message dialog from anywhere.
+            (_, KeyCode::Char('c')) => {
+                self.focus(Panel::Commit);
+                self.mode = Mode::Commit;
+            }
             (Panel::Files, KeyCode::Char('u')) => self.ask(Input::UploadPath),
             (Panel::Files, KeyCode::Char('d')) => self.ask_discard(),
 
@@ -803,6 +899,11 @@ impl App {
             (Panel::Versions, KeyCode::Char('v')) => self.ask_revert(),
 
             (Panel::Backups, KeyCode::Char('d')) => self.ask_delete_backup(),
+
+            // The panel itself only commits; the message is written in the
+            // dialog, which `c` opens from anywhere.
+            (Panel::Commit, KeyCode::Enter) => self.commit_draft(true, terminal)?,
+            (Panel::Commit, KeyCode::Char('i')) => self.mode = Mode::Commit,
             _ => {}
         }
         Ok(())
@@ -869,8 +970,9 @@ impl App {
                 if self.focus != panel {
                     self.focus(panel);
                 }
-                // Three rows per notch: one feels stuck, a whole pane overshoots.
-                self.move_selection(delta * 3);
+                // One row per notch: a list is a list of things, and moving
+                // three at a time makes it hard to land on the one you want.
+                self.move_selection(delta);
                 return;
             }
         }
@@ -1379,10 +1481,13 @@ impl App {
             return;
         }
 
+        // The message panel grows when there is a message to show: a header
+        // line, git's blank line, and room for the description.
+        let writing =
+            self.focus == Panel::Commit || !self.subject.is_empty() || !self.body.is_empty();
         let rows = Layout::vertical([
             Constraint::Min(6),
-            // The commit message: one line of text between its borders.
-            Constraint::Length(3),
+            Constraint::Length(if writing { 7 } else { 3 }),
             Constraint::Length(4),
         ])
         .split(frame.area());
@@ -1414,6 +1519,7 @@ impl App {
 
         match &self.mode {
             Mode::Edit(_) => {}
+            Mode::Commit => self.draw_commit_dialog(frame),
             Mode::Input { kind, buffer } => self.draw_input(frame, *kind, buffer),
             Mode::Confirm { question, .. } => self.draw_confirm(frame, question),
             Mode::Help => self.draw_help(frame),
@@ -1425,22 +1531,26 @@ impl App {
     /// keys are live.
     fn block(&self, panel: Panel) -> Block<'static> {
         let focused = self.focus == panel;
-        let style = if focused {
-            Style::new().fg(Color::Green).bold()
+        let (border, border_style, title_style) = if focused {
+            (
+                BorderType::Thick,
+                Style::new().fg(ACCENT),
+                Style::new().fg(ACCENT).bold(),
+            )
         } else {
-            Style::new().fg(Color::DarkGray)
+            (
+                BorderType::Plain,
+                Style::new().fg(FAINT),
+                Style::new().fg(MUTED),
+            )
         };
         Block::default()
             .borders(Borders::ALL)
-            .border_style(style)
-            .title(Span::styled(
-                panel.title(),
-                if focused {
-                    Style::new().fg(Color::Green).bold()
-                } else {
-                    Style::new()
-                },
-            ))
+            .border_type(border)
+            .border_style(border_style)
+            // One column of breathing room on each side.
+            .padding(Padding::horizontal(1))
+            .title(Span::styled(panel.title(), title_style))
     }
 
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
@@ -1456,9 +1566,9 @@ impl App {
             )
         };
         let state = if self.dirty {
-            Span::styled("changes", Style::new().fg(Color::Yellow))
+            Span::styled("changes", Style::new().fg(WARN))
         } else {
-            Span::styled("clean", Style::new().fg(Color::Green))
+            Span::styled("clean", Style::new().fg(OK))
         };
         let lines = vec![
             Line::from(vec![
@@ -1488,22 +1598,32 @@ impl App {
                 // lazygit uses, and the fastest way to read an index.
                 let unchanged = !file.staged && !file.unstaged && !file.untracked;
                 let colour = if unchanged {
-                    Color::DarkGray
+                    FAINT
                 } else if file.staged && !file.unstaged {
-                    Color::Green
+                    OK
                 } else if file.staged {
-                    Color::Yellow
+                    WARN
                 } else {
-                    Color::Red
+                    BAD
                 };
                 let path = if unchanged {
                     // Committed files recede, so the changed ones still stand out.
-                    Span::styled(file.path.clone(), Style::new().fg(Color::Gray))
+                    Span::styled(file.path.clone(), Style::new().fg(MUTED))
                 } else {
                     Span::raw(file.path.clone())
                 };
+                // A filled dot for staged, hollow for not: readable at a glance
+                // without relying on the two-letter git codes alone.
+                let mark = if unchanged {
+                    " "
+                } else if file.staged {
+                    "●"
+                } else {
+                    "○"
+                };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{} ", file.label), Style::new().fg(colour)),
+                    Span::styled(format!("{mark} "), Style::new().fg(colour)),
+                    Span::styled(format!("{} ", file.label), Style::new().fg(colour).dim()),
                     path,
                 ]))
             })
@@ -1511,7 +1631,7 @@ impl App {
         let items = if items.is_empty() {
             vec![ListItem::new(Span::styled(
                 "nothing changed",
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(MUTED),
             ))]
         } else {
             items
@@ -1528,13 +1648,13 @@ impl App {
                 // The marker shows which version the working tree holds, which
                 // is not always the newest commit.
                 let (marker, style) = if index == self.position {
-                    (">", Style::new().fg(Color::Green).bold())
+                    ("●", Style::new().fg(OK).bold())
                 } else {
-                    (" ", Style::new())
+                    ("│", Style::new().fg(FAINT))
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{marker} "), style),
-                    Span::styled(commit.id.clone(), Style::new().fg(Color::Yellow)),
+                    Span::styled(commit.id.clone(), Style::new().fg(WARN)),
                     Span::raw(format!(" {}", commit.subject)),
                 ]))
             })
@@ -1542,7 +1662,7 @@ impl App {
         let items = if items.is_empty() {
             vec![ListItem::new(Span::styled(
                 "no commits yet",
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(MUTED),
             ))]
         } else {
             items
@@ -1559,7 +1679,7 @@ impl App {
                     Span::raw(row.name.clone()),
                     Span::styled(
                         format!("  {}", ops::human_bytes(row.bytes)),
-                        Style::new().fg(Color::DarkGray),
+                        Style::new().fg(MUTED),
                     ),
                 ]))
             })
@@ -1567,7 +1687,7 @@ impl App {
         let items = if items.is_empty() {
             vec![ListItem::new(Span::styled(
                 "none - press n",
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(MUTED),
             ))]
         } else {
             items
@@ -1584,15 +1704,20 @@ impl App {
         // The selection is always set, so the list scrolls itself to keep the
         // cursor in view; only its highlight depends on focus.
         state.select(Some(selected));
-        let highlight = if self.focus == panel {
-            Style::new().reversed()
+        let (highlight, symbol) = if self.focus == panel {
+            (
+                Style::new().bg(SELECTED_BG).fg(ACCENT).bold(),
+                // The bar is the same width in both states, so rows never shift.
+                "▌ ",
+            )
         } else {
-            Style::new().add_modifier(Modifier::DIM)
+            (Style::new().add_modifier(Modifier::DIM), "  ")
         };
         frame.render_stateful_widget(
             List::new(items)
                 .block(self.block(panel))
-                .highlight_style(highlight),
+                .highlight_style(highlight)
+                .highlight_symbol(symbol),
             area,
             &mut state,
         );
@@ -1631,11 +1756,11 @@ impl App {
                 }
                 // Patch colouring, by the first character of each line.
                 let style = match line.chars().next() {
-                    Some('+') => Style::new().fg(Color::Green),
-                    Some('-') => Style::new().fg(Color::Red),
-                    Some('@') => Style::new().fg(Color::Cyan),
+                    Some('+') => Style::new().fg(OK),
+                    Some('-') => Style::new().fg(BAD),
+                    Some('@') => Style::new().fg(ACCENT),
                     _ if line.starts_with("diff ") || line.starts_with("index ") => {
-                        Style::new().fg(Color::DarkGray)
+                        Style::new().fg(FAINT)
                     }
                     _ => Style::new(),
                 };
@@ -1658,8 +1783,9 @@ impl App {
             Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::new().fg(Color::DarkGray))
-                    .title(title),
+                    .border_style(Style::new().fg(FAINT))
+                    .padding(Padding::horizontal(1))
+                    .title(Span::styled(title, Style::new().fg(MUTED))),
             ),
             area,
         );
@@ -1676,51 +1802,192 @@ impl App {
         }
     }
 
-    /// The commit message panel: the text being written, or a hint when empty.
+    /// The commit message panel: a header line, then the longer description.
     fn draw_commit(&self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Panel::Commit;
-        let line = if self.message_draft.is_empty() && !focused {
-            Line::from(Span::styled(
-                "press c to write a commit message",
-                Style::new().fg(Color::DarkGray),
-            ))
+        let block = self.block(Panel::Commit);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if !focused && self.subject.is_empty() && self.body.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "press c to write a commit message",
+                    Style::new().fg(MUTED),
+                ))),
+                inner,
+            );
+            return;
+        }
+
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+        // The header line, with a caret while it is the field being typed into.
+        let mut header = vec![Span::raw(self.subject.clone())];
+        if focused && self.field == Field::Subject {
+            header.push(Span::styled("_", Style::new().fg(ACCENT).bold()));
+        } else if self.subject.is_empty() {
+            header.push(Span::styled("header line", Style::new().fg(FAINT).italic()));
+        }
+        frame.render_widget(Paragraph::new(Line::from(header)), rows[0]);
+
+        // Git's blank line between the header and the description, doubling as
+        // a hint about which key does what.
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                if focused {
+                    "down/up switch field   enter commits from the header   ctrl-l local only"
+                } else {
+                    ""
+                },
+                Style::new().fg(MUTED),
+            ))),
+            rows[1],
+        );
+
+        let mut description = self.body.clone();
+        if focused && self.field == Field::Body {
+            description.push('_');
+        } else if self.body.is_empty() {
+            description = "longer description (optional)".to_string();
+        }
+        let style = if self.body.is_empty() && !(focused && self.field == Field::Body) {
+            Style::new().fg(FAINT).italic()
         } else {
-            let mut spans = vec![Span::raw(self.message_draft.clone())];
-            if focused {
-                // A visible caret, since the terminal cursor is not used here.
-                spans.push(Span::styled("_", Style::new().fg(Color::Cyan).bold()));
-            }
-            Line::from(spans)
+            Style::new()
         };
-        frame.render_widget(Paragraph::new(line).block(self.block(Panel::Commit)), area);
+        frame.render_widget(
+            Paragraph::new(Text::styled(description, style)).wrap(Wrap { trim: false }),
+            rows[2],
+        );
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
-        // Only the focused panel's keys, plus the handful that always work.
         let mut keys: Vec<Span> = Vec::new();
-        for (key, what, _) in self.focus.keys() {
+        for (index, (key, short, _, _)) in self.focus.keys().iter().enumerate() {
+            if index > 0 {
+                keys.push(Span::styled(" · ", Style::new().fg(FAINT)));
+            }
             keys.push(Span::styled(
-                format!("{key} "),
-                Style::new().fg(Color::Yellow),
+                (*key).to_string(),
+                Style::new().fg(ACCENT).bold(),
             ));
-            keys.push(Span::raw(format!("{what}   ")));
+            keys.push(Span::styled(format!(" {short}"), Style::new().fg(MUTED)));
         }
-        let global = "tab panel  j/k move  pgup/pgdn page  J/K + ctrl-d/u scroll diff  wheel  ? keys  q quit";
+        let global = "1-5 panel · tab cycle · j/k move · J/K scroll diff · ? keys · q quit";
         let lines = vec![
-            Line::from(Span::styled(
-                self.message.clone(),
-                Style::new().fg(Color::Cyan),
-            )),
+            Line::from(Span::styled(self.message.clone(), Style::new().fg(ACCENT))),
             Line::from(keys),
-            Line::from(Span::styled(global, Style::new().fg(Color::DarkGray))),
+            Line::from(Span::styled(global, Style::new().fg(FAINT))),
         ];
         frame.render_widget(
-            Paragraph::new(lines).block(
+            Paragraph::new(lines).wrap(Wrap { trim: true }).block(
                 Block::default()
                     .borders(Borders::TOP)
-                    .border_style(Style::new().fg(Color::DarkGray)),
+                    .border_style(Style::new().fg(FAINT))
+                    .padding(Padding::horizontal(1)),
             ),
             area,
+        );
+    }
+
+    /// The commit message dialog: a header line, a separator, and the longer
+    /// description beneath it - the shape git itself uses for a message.
+    fn draw_commit_dialog(&self, frame: &mut Frame) {
+        let area = centred(frame.area(), 76, 14);
+        frame.render_widget(Clear, area);
+
+        let staged = self.files.iter().filter(|f| f.staged).count();
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
+            .border_style(Style::new().fg(ACCENT))
+            .padding(Padding::horizontal(1))
+            .title(Span::styled(
+                " COMMIT MESSAGE ",
+                Style::new().fg(ACCENT).bold(),
+            ))
+            .title_bottom(Span::styled(
+                format!(" {staged} staged "),
+                Style::new().fg(MUTED),
+            ));
+        let inner = outer.inner(area);
+        frame.render_widget(outer, area);
+
+        let rows = Layout::vertical([
+            // The header line.
+            Constraint::Length(1),
+            // The separator between the two halves of the message.
+            Constraint::Length(1),
+            // The description.
+            Constraint::Min(3),
+            // What the keys do.
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+        let writing_header = self.field == Field::Subject;
+        let mut header = vec![Span::raw(self.subject.clone())];
+        if writing_header {
+            header.push(Span::styled("_", Style::new().fg(ACCENT).bold()));
+        } else if self.subject.is_empty() {
+            header.push(Span::styled("header line", Style::new().fg(FAINT).italic()));
+        }
+        frame.render_widget(Paragraph::new(Line::from(header)), rows[0]);
+
+        // The separator: a rule across the dialog, labelled so it is obvious
+        // which half is which. In the commit itself this is the blank line git
+        // puts between the header and the description.
+        let label = " description ";
+        let width = rows[1].width as usize;
+        let rule = if width > label.len() + 4 {
+            format!("──{label}{}", "─".repeat(width - label.len() - 2))
+        } else {
+            "─".repeat(width)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(rule, Style::new().fg(MUTED)))),
+            rows[1],
+        );
+
+        let mut description = self.body.clone();
+        if !writing_header {
+            description.push('_');
+        }
+        let style = if self.body.is_empty() && writing_header {
+            description = "(optional - press down or tab to write it)".to_string();
+            Style::new().fg(FAINT).italic()
+        } else {
+            Style::new()
+        };
+        frame.render_widget(
+            Paragraph::new(Text::styled(description, style)).wrap(Wrap { trim: false }),
+            rows[2],
+        );
+
+        let field = if writing_header {
+            "header"
+        } else {
+            "description"
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!("writing the {field}"),
+                    Style::new().fg(ACCENT),
+                )),
+                Line::from(Span::styled(
+                    "down/up or tab switch field   enter (from the header) commits and pushes   ctrl-l commits locally   esc closes, keeping the draft",
+                    Style::new().fg(MUTED),
+                )),
+            ])
+            .wrap(Wrap { trim: true }),
+            rows[3],
         );
     }
 
@@ -1731,16 +1998,18 @@ impl App {
             Line::from(vec![
                 Span::raw("> "),
                 Span::styled(buffer.to_string(), Style::new().bold()),
-                Span::styled("_", Style::new().fg(Color::DarkGray)),
+                Span::styled("_", Style::new().fg(MUTED)),
             ]),
-            Line::from(Span::styled(kind.hint(), Style::new().fg(Color::DarkGray))),
+            Line::from(Span::styled(kind.hint(), Style::new().fg(MUTED))),
         ];
         frame.render_widget(
             Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::new().fg(Color::Cyan))
-                    .title(kind.title()),
+                    .border_type(BorderType::Thick)
+                    .border_style(Style::new().fg(ACCENT))
+                    .padding(Padding::horizontal(1))
+                    .title(Span::styled(kind.title(), Style::new().fg(ACCENT).bold())),
             ),
             area,
         );
@@ -1754,15 +2023,17 @@ impl App {
             Line::from(""),
             Line::from(Span::styled(
                 "y to confirm, anything else cancels",
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(MUTED),
             )),
         ];
         frame.render_widget(
             Paragraph::new(lines).wrap(Wrap { trim: true }).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::new().fg(Color::Red))
-                    .title(" are you sure? "),
+                    .border_type(BorderType::Thick)
+                    .border_style(Style::new().fg(BAD))
+                    .padding(Padding::horizontal(1))
+                    .title(Span::styled(" ARE YOU SURE? ", Style::new().fg(BAD).bold())),
             ),
             area,
         );
@@ -1776,11 +2047,11 @@ impl App {
             )),
             Line::from(""),
         ];
-        lines.extend(self.focus.keys().iter().map(|(key, what, command)| {
+        lines.extend(self.focus.keys().iter().map(|(key, _, what, command)| {
             Line::from(vec![
-                Span::styled(format!("  {key:<6}"), Style::new().fg(Color::Yellow)),
+                Span::styled(format!("  {key:<6}"), Style::new().fg(WARN)),
                 Span::raw(format!("{what:<26}")),
-                Span::styled((*command).to_string(), Style::new().fg(Color::DarkGray)),
+                Span::styled((*command).to_string(), Style::new().fg(MUTED)),
             ])
         }));
         lines.push(Line::from(""));
@@ -1801,14 +2072,14 @@ impl App {
             ("q", "quit"),
         ] {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<11}"), Style::new().fg(Color::Yellow)),
+                Span::styled(format!("  {key:<11}"), Style::new().fg(WARN)),
                 Span::raw(what),
             ]));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "press any key to close",
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(MUTED),
         )));
 
         let area = centred(frame.area(), 76, (lines.len() + 2) as u16);
@@ -1817,8 +2088,10 @@ impl App {
             Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::new().fg(Color::Cyan))
-                    .title(" keys "),
+                    .border_type(BorderType::Thick)
+                    .border_style(Style::new().fg(ACCENT))
+                    .padding(Padding::horizontal(1))
+                    .title(Span::styled(" KEYS ", Style::new().fg(ACCENT).bold())),
             ),
             area,
         );
@@ -1927,6 +2200,21 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// Join a header and a description the way git expects them: the header, a
+/// blank line, then the description. Either may be empty, and trailing
+/// whitespace is dropped so a stray newline never becomes part of the message.
+fn compose_message(subject: &str, body: &str) -> String {
+    let subject = subject.trim();
+    let body = body.trim();
+    if subject.is_empty() {
+        return String::new();
+    }
+    if body.is_empty() {
+        return subject.to_string();
+    }
+    format!("{subject}\n\n{body}")
+}
+
 /// Draw the buffer, a gutter of line numbers, and vim's status line. Returns
 /// the rectangle the text itself occupies, which is what turns a click into a
 /// line and column.
@@ -1952,9 +2240,9 @@ fn draw_editor(frame: &mut Frame, area: Rect, editor: &Editor) -> Rect {
         numbers.push(Line::from(Span::styled(
             format!("{:>width$} ", index + 1, width = gutter_width as usize - 1),
             if current {
-                Style::new().fg(Color::Yellow)
+                Style::new().fg(WARN)
             } else {
-                Style::new().fg(Color::DarkGray)
+                Style::new().fg(FAINT)
             },
         )));
         // Highlight per visible line: nothing off-screen is ever tokenised.
@@ -1972,22 +2260,32 @@ fn draw_editor(frame: &mut Frame, area: Rect, editor: &Editor) -> Rect {
     // The status line: mode on the left, position on the right, as in vim.
     let mode = editor.mode.label();
     let modified = if editor.modified { " [+]" } else { "" };
-    let left = format!(" {mode}  {}{modified}  {}", editor.name(), editor.status());
     let right = format!("{},{} ", editor.line + 1, editor.column + 1);
-    let padding =
-        (rows[1].width as usize).saturating_sub(left.chars().count() + right.chars().count());
+    let used = mode.len()
+        + 2
+        + editor.name().chars().count()
+        + modified.len()
+        + 2
+        + editor.status().chars().count();
+    let padding = (rows[1].width as usize).saturating_sub(used + right.chars().count());
     frame.render_widget(
         Paragraph::new(Line::from(vec![
+            // A mode badge, rather than washing the whole line in colour.
             Span::styled(
-                left,
+                format!(" {mode} "),
                 match editor.mode {
-                    editor::Mode::Insert => Style::new().fg(Color::Black).bg(Color::Green),
-                    editor::Mode::Command => Style::new().fg(Color::Black).bg(Color::Cyan),
-                    editor::Mode::Normal => Style::new().fg(Color::Black).bg(Color::Gray),
+                    editor::Mode::Insert => Style::new().fg(Color::Black).bg(OK).bold(),
+                    editor::Mode::Command => Style::new().fg(Color::Black).bg(ACCENT).bold(),
+                    editor::Mode::Normal => Style::new().fg(Color::Black).bg(MUTED).bold(),
                 },
             ),
+            Span::styled(
+                format!(" {}{modified}", editor.name()),
+                Style::new().fg(MUTED),
+            ),
+            Span::styled(format!("  {}", editor.status()), Style::new().fg(ACCENT)),
             Span::raw(" ".repeat(padding)),
-            Span::styled(right, Style::new().fg(Color::DarkGray)),
+            Span::styled(right, Style::new().fg(FAINT)),
         ])),
         rows[1],
     );
@@ -2010,14 +2308,14 @@ fn draw_editor(frame: &mut Frame, area: Rect, editor: &Editor) -> Rect {
 /// keywords carry the structure.
 fn style_for(kind: Kind) -> Style {
     match kind {
-        Kind::Comment => Style::new().fg(Color::DarkGray).italic(),
-        Kind::Str => Style::new().fg(Color::Green),
-        Kind::Number => Style::new().fg(Color::Magenta),
-        Kind::Keyword => Style::new().fg(Color::Blue).bold(),
-        Kind::Constant => Style::new().fg(Color::Yellow),
-        Kind::Key => Style::new().fg(Color::Cyan),
-        Kind::Section => Style::new().fg(Color::Yellow).bold(),
-        Kind::Punctuation => Style::new().fg(Color::Gray),
+        Kind::Comment => Style::new().fg(FAINT).italic(),
+        Kind::Str => Style::new().fg(OK),
+        Kind::Number => Style::new().fg(Color::Indexed(176)),
+        Kind::Keyword => Style::new().fg(ACCENT).bold(),
+        Kind::Constant => Style::new().fg(WARN),
+        Kind::Key => Style::new().fg(Color::Indexed(80)),
+        Kind::Section => Style::new().fg(WARN).bold(),
+        Kind::Punctuation => Style::new().fg(MUTED),
         Kind::Plain => Style::new(),
     }
 }
@@ -2025,6 +2323,34 @@ fn style_for(kind: Kind) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_header_alone_is_the_whole_message() {
+        assert_eq!(compose_message("tweak waybar", ""), "tweak waybar");
+        // Whitespace the user did not mean to type is dropped.
+        assert_eq!(compose_message("  tweak waybar  ", "   "), "tweak waybar");
+    }
+
+    #[test]
+    fn a_description_is_separated_from_the_header_by_a_blank_line() {
+        assert_eq!(
+            compose_message("tweak waybar", "The clock module was too wide."),
+            "tweak waybar\n\nThe clock module was too wide."
+        );
+        // A multi-line description keeps its own line breaks.
+        assert_eq!(
+            compose_message("fix hypr", "first line\nsecond line"),
+            "fix hypr\n\nfirst line\nsecond line"
+        );
+    }
+
+    #[test]
+    fn a_description_without_a_header_is_not_a_message() {
+        // `git log --oneline` would have nothing to show, so this is refused
+        // rather than turned into a header.
+        assert_eq!(compose_message("", "just a description"), "");
+        assert_eq!(compose_message("", ""), "");
+    }
 
     #[test]
     fn content_shorter_than_the_pane_cannot_scroll() {

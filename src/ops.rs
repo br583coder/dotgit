@@ -416,6 +416,40 @@ mod tests {
     }
 
     #[test]
+    fn pushing_sends_existing_commits_without_making_another() {
+        let (dir, repo) = scratch("push");
+        commit(&repo, &dir, "conf", "one\n", "first");
+
+        // A bare repository standing in for the forge.
+        let remote_dir = std::env::temp_dir().join("dotgit-ops-push-remote.git");
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let remote = Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+
+        // Two commits made without pushing, as `--no-push` or the TUI would.
+        commit(&repo, &dir, "conf", "two\n", "second");
+        let head = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+        push(&repo, false).unwrap();
+
+        // Both commits are on the remote, and nothing new was committed.
+        assert_eq!(
+            remote
+                .find_reference("refs/heads/main")
+                .or_else(|_| remote.find_reference("refs/heads/master"))
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+            head
+        );
+        assert_eq!(history::chain(&repo).unwrap().len(), 2);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&remote_dir).unwrap();
+    }
+
+    #[test]
     fn tracked_files_are_listed_after_they_are_committed() {
         let (dir, repo) = scratch("tracked");
         commit(&repo, &dir, "kept", "one\n", "first");

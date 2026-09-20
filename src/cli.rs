@@ -39,6 +39,8 @@ enum CliCommand {
         #[arg(long)]
         no_push: bool,
     },
+    /// Push commits you already made, without making another one
+    Push,
     /// Revert a commit and push the resulting commit
     Revert {
         /// Commit or revision to revert (prompts with recent commits if omitted)
@@ -119,6 +121,7 @@ pub fn run() {
     let result = match cli.command {
         CliCommand::Upload { paths } => upload(&paths),
         CliCommand::Commit { message, no_push } => commit(message, no_push),
+        CliCommand::Push => push_only(),
         CliCommand::Revert { commit } => revert(commit),
         CliCommand::New {
             name,
@@ -166,6 +169,7 @@ pub fn run() {
         match command {
             CliCommand::Upload { .. } => "upload",
             CliCommand::Commit { .. } => "commit",
+            CliCommand::Push => "push",
             CliCommand::Revert { .. } => "revert",
             CliCommand::New { .. } => "new",
             CliCommand::Restore => "restore",
@@ -268,6 +272,39 @@ fn revert(commit: Option<String>) -> Result<()> {
         println!("message: {}", message.lines().next().unwrap_or_default());
     }
     Ok(())
+}
+
+/// Push whatever is already committed. No message, no commit: this is for
+/// commits made earlier - with `dotgit commit --no-push`, in the terminal UI,
+/// or with plain git - and for retrying a push that failed.
+fn push_only() -> Result<()> {
+    let repo = git::open_repo()?;
+    let branch = git::current_branch(&repo)?;
+    if let Some(ahead) = commits_ahead(&repo, &branch) {
+        // Saying how many commits are going makes it obvious when the answer is
+        // none, which is the confusing case otherwise.
+        if ahead == 0 {
+            println!("nothing to push: {branch} matches origin/{branch}");
+            return Ok(());
+        }
+        println!("pushing {ahead} commit(s) on {branch}");
+    }
+    push(&repo)
+}
+
+/// How many commits the branch has that its remote-tracking branch does not, or
+/// `None` when there is nothing to compare against - a branch that has never
+/// been pushed, or a remote we have not fetched.
+fn commits_ahead(repo: &git2::Repository, branch: &str) -> Option<usize> {
+    let local = repo.revparse_single(branch).ok()?.peel_to_commit().ok()?;
+    let remote = repo
+        .revparse_single(&format!("refs/remotes/origin/{branch}"))
+        .ok()?
+        .peel_to_commit()
+        .ok()?;
+    repo.graph_ahead_behind(local.id(), remote.id())
+        .ok()
+        .map(|(ahead, _behind)| ahead)
 }
 
 fn push(repo: &git2::Repository) -> Result<()> {
